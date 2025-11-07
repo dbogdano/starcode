@@ -56,7 +56,8 @@ int starcode(
          double parent_to_child,
    const int showclusters,
    const int showids,
-   const int outputt
+   const int outputt,
+   FILE *blacklistf
 );
 
 #endif
