@@ -193,7 +193,7 @@ main(
          {"output1",           required_argument,        0, '3'},
          {"output2",           required_argument,        0, '4'},
          {"blacklist-file",    required_argument,        0, 'b'},
-         {"allow-pattern",     required_argument,        0, 'a'},
+         {"allow",     required_argument,                0, 'a'},
          {0, 0, 0, 0}
       };
 

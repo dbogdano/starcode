@@ -528,6 +528,12 @@ if (blacklistf != NULL) {
   if (verbose) fprintf(stderr, "loading blacklist\n");
   load_blacklist(blacklistf);
 }
+/* Apply allow-pattern provided from main() so new_useq() can use it. */
+if (allow_pattern != NULL) {
+  set_allow_pattern(allow_pattern);
+  if (verbose)
+    fprintf(stderr, "debug: starcode: allow-pattern='%s'\n", allow_pattern);
+}
 
   if (verbose) {
     fprintf(stderr, "running %s (last revised %s) with %d thread%s\n",
@@ -539,6 +545,15 @@ if (blacklistf != NULL) {
     fprintf(stderr, "input file empty\n");
     return 1;
   }
+
+  /* Debug, count how many sequences were marked blacklisted at the read time*/
+  if (verbose) {
+    size_t bc = 0;
+    for (size_t i = 0; i < uSQ->nitems; ++i)
+      if (((useq_t*)uSQ->items[i])->blacklisted) ++bc;
+    fprintf(stderr, "debug: %zu/%zu sequences marked blacklisted\n", bc, uSQ->nitems);
+    }
+
 
   const long int nseq = uSQ->nitems;
 
