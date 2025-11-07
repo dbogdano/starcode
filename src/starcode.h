@@ -57,7 +57,8 @@ int starcode(
    const int showclusters,
    const int showids,
    const int outputt,
-   FILE *blacklistf
+   FILE *blacklistf,
+      const char *allow_pattern
 );
 
 #endif

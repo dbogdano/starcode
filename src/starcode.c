@@ -234,9 +234,10 @@ static double CLUSTER_RATIO = 5.0;         // min parent/child ratio
 
 // Global blacklist (simple list of uppercase sequences)
 static gstack_t* BLACKLIST = NULL;
+// Optional IUPAC allow pattern (Uppercase)
+static char* ALLOW_PATTERN = NULL;
 
-void
-head_default(useq_t* u, propt_t propt) {
+void head_default(useq_t* u, propt_t propt) {
   useq_t* cncal = u->canonical;
   char* seq = propt.pe_fastq ? cncal->info : cncal->seq;
 
@@ -248,16 +249,14 @@ head_default(useq_t* u, propt_t propt) {
   }
 }
 
-void
-members_mp_default(useq_t* u, propt_t propt) {
+void members_mp_default(useq_t* u, propt_t propt) {
   if (!propt.showclusters)
     return;
   char* seq = propt.pe_fastq ? u->info : u->seq;
   fprintf(OUTPUTF1, ",%s", seq);
 }
 
-void
-members_sc_default(useq_t* u, propt_t propt) {
+void members_sc_default(useq_t* u, propt_t propt) {
   // Nothing to print if clusters are not shown, or
   // if this sequence has no match.
   if (!propt.showclusters || u->matches == NULL)
@@ -275,8 +274,7 @@ members_sc_default(useq_t* u, propt_t propt) {
   }
 }
 
-void
-sort_and_print_ids(idstack_t* stack) {
+void sort_and_print_ids(idstack_t* stack) {
   // Sort sequence of integers.
   qsort(stack->elm, stack->pos, sizeof(int), int_ascending);
   // Print ids.
@@ -286,8 +284,7 @@ sort_and_print_ids(idstack_t* stack) {
   }
 }
 
-void
-sort_and_print_ids_perread(idstack_t* stack,
+void sort_and_print_ids_perread(idstack_t* stack,
     useq_t* canonical,
     int showids) {
   // Sort sequence of integers.
@@ -300,26 +297,22 @@ sort_and_print_ids_perread(idstack_t* stack,
   }
 }
 
-void
-print_nr_raw(useq_t* u) {
+void print_nr_raw(useq_t* u) {
   fprintf(OUTPUTF1, "%s\n", u->seq);
 }
 
-void
-print_nr_fasta(useq_t* u) {
+void print_nr_fasta(useq_t* u) {
   fprintf(OUTPUTF1, "%s\n%s\n", u->info, u->seq);
 }
 
-void
-print_nr_fastq(useq_t* u) {
+void print_nr_fastq(useq_t* u) {
   char header[M] = {0};
   char quality[M] = {0};
   sscanf(u->info, "%s\n%s", header, quality);
   fprintf(OUTPUTF1, "%s\n%s\n+\n%s\n", header, u->seq, quality);
 }
 
-void
-print_nr_pe_fastq(useq_t* u) {
+void print_nr_pe_fastq(useq_t* u) {
   char head1[M] = {0};
   char head2[M] = {0};
   char qual1[M] = {0};
@@ -348,8 +341,7 @@ print_nr_pe_fastq(useq_t* u) {
   fprintf(OUTPUTF2, "%s\n%s\n+\n%s\n", head2, seq2, qual2);
 }
 
-void
-print_tidy( // Private
+void print_tidy( // Private
     const long int nseq, // Total number of sequences
     const gstack_t* uSQ,  // Stack of useq after clustering
     const int is_pe_fastq // Whether output is PE FASTQ
@@ -448,8 +440,64 @@ int blacklist_contains(const char* seq) {
   return 0;
 }
 
+// Set allow pattern (stores uppercased copy)
+void set_allow_pattern(const char* pat) {
+  if (pat == NULL) return;
+  free(ALLOW_PATTERN);
+  size_t len = strlen(pat);
+  ALLOW_PATTERN = malloc(len + 1);
+  if (ALLOW_PATTERN == NULL) { alert(); krash(); }
+  for (size_t i = 0; i < len; ++i)
+    ALLOW_PATTERN[i] = capitalize[(unsigned char)pat[i]];
+  ALLOW_PATTERN[len] = '\0';
+  fprintf(stderr, "debug: allow pattern set to '%s'\n", ALLOW_PATTERN);
+}
 
-int
+// Return 1 if a single sequence char 'c' is allowed by IUPAC code 'p'.
+static int iupac_char_allows(char p, char c) {
+  // both inputs expected uppercase ASCII
+  switch (p) {
+  case 'A': return (c == 'A');
+  case 'C': return (c == 'C');
+  case 'G': return (c == 'G');
+  case 'T': return (c == 'T');
+  case 'R': return (c == 'A' || c == 'G');
+  case 'Y': return (c == 'C' || c == 'T');
+  case 'S': return (c == 'G' || c == 'C');
+  case 'W': return (c == 'A' || c == 'T');
+  case 'K': return (c == 'G' || c == 'T');
+  case 'M': return (c == 'A' || c == 'C');
+  case 'B': return (c == 'C' || c == 'G' || c == 'T');
+  case 'D': return (c == 'A' || c == 'G' || c == 'T');
+  case 'H': return (c == 'A' || c == 'C' || c == 'T');
+  case 'V': return (c == 'A' || c == 'C' || c == 'G');
+  case 'N': return (c == 'A' || c == 'C' || c == 'G' || c == 'T');
+  case '-': return (c == '-'); // allow hyphen if pattern includes it
+  default:  return 0;
+  }
+}
+
+// Return 1 if seq matches pattern (both uppercase), lengths must match.
+int iupac_matches(const char* pattern, const char* seq) {
+  if (pattern == NULL) return 1; // nothing to check -> allowed
+  if (seq == NULL) return 0;
+  size_t plen = strlen(pattern);
+  size_t slen = strlen(seq);
+  if (plen != slen) return 0;
+  for (size_t i = 0; i < plen; ++i) {
+    char p = pattern[i];
+    char c = seq[i];
+    // map seq char to uppercase via existing table
+    if ((unsigned char)c < sizeof(capitalize))
+      c = capitalize[(unsigned char)c];
+    if (!iupac_char_allows(p, c))
+      return 0;
+  }
+  return 1;
+}
+
+
+int 
 starcode(                // Public
     FILE* inputf1,           // First input file
     FILE* inputf2,           // Second input file (fastq)
@@ -463,7 +511,8 @@ starcode(                // Public
     const int showclusters,  // Print cluster members
     const int showids,       // Print sequence ID numbers
     const int outputt,       // Output type (format)
-    FILE* blacklistf         // Blacklist file
+    FILE* blacklistf,         // Blacklist file
+    const char* allow_pattern // Allow pattern
 )
 // SYNOPSIS:
 //   Performs all-pairs sequence clustering.
@@ -2315,8 +2364,14 @@ new_useq(int count, char* seq, char* info) {
   new->sphere_c = 0;
   new->sphere_d = 0;
   new->seqid = NULL;
-  new->blacklisted = blacklist_contains(new->seq);
+  // Blacklisted if present in file blacklist OR if an allow-pattern is set and the seq does not match it.
   new->matches = 0;  
+  if (BLACKLIST && blacklist_contains(new->seq))
+    new->blacklisted = 1;
+  if (ALLOW_PATTERN && !iupac_matches(ALLOW_PATTERN, new->seq))
+    new->blacklisted = 1;
+  new->matches = 0;
+
   if (info != NULL) {
     new->info = strdup(info);
     if (new->info == NULL) {

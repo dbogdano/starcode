@@ -153,6 +153,7 @@ main(
    char * output  = UNSET;
    char * output1 = UNSET;
    char * output2 = UNSET;
+   char * allow_pattern = NULL;
 
    // Set input and output files
    FILE *inputf1 = NULL;
@@ -191,11 +192,12 @@ main(
          {"threads",           required_argument,        0, 't'},
          {"output1",           required_argument,        0, '3'},
          {"output2",           required_argument,        0, '4'},
-         {"blacklist-file",         required_argument,        0, 'b'},
+         {"blacklist-file",    required_argument,        0, 'b'},
+         {"allow-pattern",     required_argument,        0, 'a'},
          {0, 0, 0, 0}
       };
 
-      c = getopt_long(argc, argv, "1:2:3:4:b:d:hi:o:qcst:r:v",
+      c = getopt_long(argc, argv, "1:2:3:4:b:a:d:hi:o:qcst:r:v",
             long_options, &option_index);
  
       // Done parsing //
@@ -258,6 +260,8 @@ main(
                     ERRM, optarg);
                 return EXIT_FAILURE;
             }
+            // Debug: confirm file opened and pointer value
+            fprintf(stderr, "debug: opened blacklist file '%s' -> %p\n", optarg, (void*)blacklistf);
         }
         else {
             fprintf(stderr, "%s --blacklist set more than once\n", ERRM);
@@ -265,6 +269,21 @@ main(
             return EXIT_FAILURE;
         }
         break;
+
+      case 'a':
+         if (allow_pattern == NULL) {
+            allow_pattern = strdup(optarg);
+            if (allow_pattern == NULL) { 
+               fprintf(stderr, "%s memory allocation error\n", ERRM);
+               return EXIT_FAILURE;
+            }
+            fprintf(stderr, "debug: allow-pattern set to '%s'\n", allow_pattern);
+         } else {
+            fprintf(stderr, "%s --allow set more than once\n", ERRM);
+            say_usage();
+            return EXIT_FAILURE;
+         }
+         break;
 
       case 'd':
          if (dist < 0) {
@@ -535,7 +554,8 @@ main(
        cl_flag,
        id_flag,
        output_type,
-       blacklistf
+       blacklistf,
+       allow_pattern
    );
 
    if (inputf1 != stdin)   fclose(inputf1);
@@ -543,6 +563,7 @@ main(
    if (outputf1 != stdout) fclose(outputf1);
    if (outputf2 != NULL)   fclose(outputf2);
    if (blacklistf != NULL) fclose(blacklistf);
+   if (allow_pattern) free(allow_pattern);
 
    return exitcode;
 
