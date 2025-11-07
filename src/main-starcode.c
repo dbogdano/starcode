@@ -154,6 +154,15 @@ main(
    char * output1 = UNSET;
    char * output2 = UNSET;
 
+   // Set input and output files
+   FILE *inputf1 = NULL;
+   FILE *inputf2 = NULL;
+   FILE *outputf1 = NULL;
+   FILE *outputf2 = NULL;
+   FILE *blacklistf = NULL;
+
+   
+
 
    if (argc == 1 && isatty(0)) {
       say_usage();
@@ -182,7 +191,7 @@ main(
          {"threads",           required_argument,        0, 't'},
          {"output1",           required_argument,        0, '3'},
          {"output2",           required_argument,        0, '4'},
-         {"blacklist",         required_argument,        0, 'b'},
+         {"blacklist-file",         required_argument,        0, 'b'},
          {0, 0, 0, 0}
       };
 
@@ -432,14 +441,6 @@ main(
 
 
 
-   // Set input file(s). //
-   FILE *inputf1 = NULL;
-   FILE *inputf2 = NULL;
-   FILE *blacklistf = NULL; 
-
-   // Set output file(s). //
-   FILE *outputf1 = NULL;
-   FILE *outputf2 = NULL;
 
    if (input != UNSET) {
       inputf1 = fopen(input, "r");
