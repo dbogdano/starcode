@@ -465,12 +465,12 @@ starcode(                // Public
   CLUSTERALG = clusteralg;
   CLUSTER_RATIO = parent_to_child;
  
-+ // Load blacklist before reading sequences so new_useq() can mark them.
-+ if (blacklistf != NULL) {
-+   if (verbose) fprintf(stderr, "loading blacklist\n");
-+   load_blacklist(blacklistf);
-+ }
-+
+// Load blacklist before reading sequences so new_useq() can mark them.
+if (blacklistf != NULL) {
+  if (verbose) fprintf(stderr, "loading blacklist\n");
+  load_blacklist(blacklistf);
+}
+
   if (verbose) {
     fprintf(stderr, "running %s (last revised %s) with %d thread%s\n",
         VERSION, DATE, thrmax, thrmax > 1 ? "s" : "");
