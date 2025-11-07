@@ -408,24 +408,33 @@ print_tidy( // Private
   free(outputseq);
 }
 
+
 // Load a blacklist file (one barcode per line). Uppercases entries.
 void load_blacklist(FILE* f) {
   if (f == NULL) return;
   if (BLACKLIST == NULL) BLACKLIST = new_gstack();
   ssize_t nread;
-  size_t nchar = M;
-  char* line = malloc(M);
-  if (line == NULL) { alert(); krash(); }
-  while ((nread = getline(&line, &nchar, f)) >= (ssize_t)-1) {
-    if (nread > 0 && line[nread - 1] == '\n') line[nread -1 ] = '\0';
-    // upperase using existing table
-    size_t len = (size_t)nread;
+  size_t nchar = 0;
+  char* line = NULL;
+  if (line == NULL) {
+    /* let getline allocate the buffer */
+    nchar = 0;
+  }
+  while ((nread = getline(&line, &nchar, f)) != (ssize_t)-1) {
+    if (nread <= 0)
+      continue;
+    if (line[nread - 1] == '\n')
+      line[nread - 1] = '\0';
+    /* Uppercase the trimmed string using existing table */
+    size_t len = strlen(line);
     for (size_t i = 0; i < len; i++)
       line[i] = capitalize[(unsigned char)line[i]];
     char* s = strdup(line);
     if (s == NULL) { alert(); krash(); }
     push(s, &BLACKLIST);
   }
+  fprintf(stderr, "debug: load_blacklist: loaded %zu entries\n",
+          BLACKLIST ? BLACKLIST->nitems : 0);
   free(line);
 }
 
@@ -2041,6 +2050,10 @@ mp_resolve_ambiguous(useq_t* useq) {
     return;
   }
 
+  // If there are no parent matches, nothing to resolve.
+  if (useq->matches == NULL)
+    return;
+
   // Get parents.
   gstack_t* matches;
   for (int i = 0; (matches = useq->matches[i]) != TOWER_TOP; i++) {
@@ -2096,11 +2109,10 @@ mp_resolve_ambiguous(useq_t* useq) {
     }
   }
 
-  // This should not ever happen. It is only a security
-  // to avoid dereferencing a null pointer below.
+  // If no valid (non-blacklisted) canonical could be found, leave
+  // this sequence without a canonical instead of crashing.
   if (canonical == NULL) {
-    alert();
-    krash();
+    return;
   }
 
   // Transfer counts and seq ids to canonical.
