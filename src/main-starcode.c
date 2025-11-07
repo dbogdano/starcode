@@ -57,6 +57,7 @@ char *USAGE =
 "  input/output options (single file, default)\n"
 "    -i --input: input file (default stdin)\n"
 "    -o --output: output file (default stdout)\n"
+"    -b --blacklist: file containing sequences that cannot be cluster centroids\n"
 "\n"
 "  input options (paired-end fastq files)\n"
 "    -1 --input1: input file 1\n"
@@ -71,6 +72,7 @@ char *USAGE =
 "       --print-clusters: outputs cluster compositions\n"
 "       --seq-id: print sequence id numbers (1-based)\n"
 "       --tidy: print each sequence and its centroid\n";
+
 
 
 void say_usage(void) { fprintf(stderr, "%s\n", USAGE); }
@@ -180,11 +182,11 @@ main(
          {"threads",           required_argument,        0, 't'},
          {"output1",           required_argument,        0, '3'},
          {"output2",           required_argument,        0, '4'},
-
+         {"blacklist",         required_argument,        0, 'b'},
          {0, 0, 0, 0}
       };
 
-      c = getopt_long(argc, argv, "1:2:3:4:d:hi:o:qcst:r:v",
+      c = getopt_long(argc, argv, "1:2:3:4:b:d:hi:o:qcst:r:v",
             long_options, &option_index);
  
       // Done parsing //
@@ -239,6 +241,21 @@ main(
          }
          break;
 
+      case 'b':
+        if (blacklistf == NULL) {
+            blacklistf = fopen(optarg, "r");
+            if (blacklistf == NULL) {
+                fprintf(stderr, "%s cannot open blacklist file %s\n", 
+                    ERRM, optarg);
+                return EXIT_FAILURE;
+            }
+        }
+        else {
+            fprintf(stderr, "%s --blacklist set more than once\n", ERRM);
+            say_usage();
+            return EXIT_FAILURE;
+        }
+        break;
 
       case 'd':
          if (dist < 0) {
@@ -418,6 +435,7 @@ main(
    // Set input file(s). //
    FILE *inputf1 = NULL;
    FILE *inputf2 = NULL;
+   FILE *blacklistf = NULL; 
 
    // Set output file(s). //
    FILE *outputf1 = NULL;
@@ -515,13 +533,15 @@ main(
        cluster_ratio,
        cl_flag,
        id_flag,
-       output_type
+       output_type,
+       blacklistf
    );
 
    if (inputf1 != stdin)   fclose(inputf1);
    if (inputf2 != NULL)    fclose(inputf2);
    if (outputf1 != stdout) fclose(outputf1);
    if (outputf2 != NULL)   fclose(outputf2);
+   if (blacklistf != NULL) fclose(blacklistf);
 
    return exitcode;
 

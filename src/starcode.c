@@ -416,10 +416,12 @@ void load_blacklist(FILE* f) {
   size_t nchar = M;
   char* line = malloc(M);
   if (line == NULL) { alert(); krash(); }
-  while ((nread = getline(&line, &nchar, f)) != -1) {
+  while ((nread = getline(&line, &nchar, f)) >= (ssize_t)-1) {
     if (nread > 0 && line[nread - 1] == '\n') line[nread -1 ] = '\0';
     // upperase using existing table
-    for (size_t i = 0; i < nread; i++) line[i] = capitalize[(int)line[i]];
+    size_t len = (size_t)nread;
+    for (size_t i = 0; i < len; i++)
+      line[i] = capitalize[(unsigned char)line[i]];
     char* s = strdup(line);
     if (s == NULL) { alert(); krash(); }
     push(s, &BLACKLIST);
@@ -438,12 +440,6 @@ int blacklist_contains(const char* seq) {
 }
 
 
-
-
-
-
-
-
 int
 starcode(                    // Public
     FILE* inputf1,           // First input file
@@ -457,7 +453,8 @@ starcode(                    // Public
     double parent_to_child,  // Merging threshold
     const int showclusters,  // Print cluster members
     const int showids,       // Print sequence ID numbers
-    const int outputt        // Output type (format)
+    const int outputt,       // Output type (format)
+    FILE* blacklistf         // Blacklist file
 )
 // SYNOPSIS:
 //   Performs all-pairs sequence clustering.
