@@ -111,6 +111,8 @@ struct useq_t {
   gstack_t** matches;  // Matches stratified by distance
   useq_t* canonical;   // Pointer to canonical sequence
   int* seqid;          // Unique ID / pointer (see above).
+  char blacklisted;    // If set, sequence cannot be canonical centroid
+  char visited;        // Internal visited flag for DFS (connected components)
 };
 
 struct lookup_t {
@@ -229,6 +231,9 @@ static output_t OUTPUTT = DEFAULT_OUTPUT;  // output type
 static cluster_t CLUSTERALG = MP_CLUSTER;  // cluster algorithm
 static double CLUSTER_RATIO = 5.0;         // min parent/child ratio
                                            // to link clusters
+
+// Global blacklist (simple list of uppercase sequences)
+static gstack_t* BLACKLIST = NULL;
 
 void
 head_default(useq_t* u, propt_t propt) {
@@ -402,6 +407,42 @@ print_tidy( // Private
   }
   free(outputseq);
 }
+
+// Load a blacklist file (one barcode per line). Uppercases entries.
+void load_blacklist(FILE* f) {
+  if (f == NULL) return;
+  if (BLACKLIST == NULL) BLACKLIST = new_gstack();
+  ssize_t nread;
+  size_t nchar = M;
+  char* line = malloc(M);
+  if (line == NULL) { alert(); krash(); }
+  while ((nread = getline(&line, &nchar, f)) != -1) {
+    if (nread > 0 && line[nread - 1] == '\n') line[nread -1 ] = '\0';
+    // upperase using existing table
+    for (size_t i = 0; i < nread; i++) line[i] = capitalize[(int)line[i]];
+    char* s = strdup(line);
+    if (s == NULL) { alert(); krash(); }
+    push(s, &BLACKLIST);
+  }
+  free(line);
+}
+
+// Return 1 if seq is in BLACKLIST, 0 otherwise.
+int blacklist_contains(const char* seq) {
+  if (BLACKLIST == NULL) return 0;
+  for (size_t i = 0; i < BLACKLIST->nitems; i++) {
+    char* bseq = (char*)BLACKLIST->items[i];
+    if (strcmp(bseq, seq) == 0) return 1;
+  }
+  return 0;
+}
+
+
+
+
+
+
+
 
 int
 starcode(                    // Public
@@ -1088,8 +1129,8 @@ count_trie_nodes(useq_t** seqs, int start, int end) {
 
 void
 connected_components(useq_t* useq, gstack_t** cluster) {
-  // Flag claimed.
-  useq->canonical = useq;
+  // Mark visited.
+  useq->visited = 1;
   // Add myself to cluster.
   push(useq, cluster);
   // Recursive call on edges.
@@ -1099,7 +1140,7 @@ connected_components(useq_t* useq, gstack_t** cluster) {
   for (int j = 0; (matches = useq->matches[j]) != TOWER_TOP; j++) {
     for (size_t k = 0; k < matches->nitems; k++) {
       useq_t* match = (useq_t*)matches->items[k];
-      if (match->canonical != NULL)
+      if (match->visited)
         continue;
       connected_components(match, cluster);
     }
@@ -1113,7 +1154,7 @@ compute_clusters(gstack_t* uSQ) {
     useq_t* useq = (useq_t*)uSQ->items[i];
 
     // Check sequence flag.
-    if (useq->canonical != NULL)
+    if (useq->visited)
       continue;
 
     // Create new cluster.
@@ -1132,44 +1173,52 @@ compute_clusters(gstack_t* uSQ) {
     }
 
     // Find centroid among cluster seqs.
-    size_t cluster_count = useq->count;
-    for (size_t k = 1; k < cluster->nitems; k++) {
+    // Sum cluster counts and choose centroid, but skip blacklisted items as centroid.
+    size_t cluster_count = 0;
+    useq_t* centroid = NULL;
+    int centroid_edges = -1;
+    for (size_t k = 0; k < cluster->nitems; k++) {
       useq_t* s = (useq_t*)cluster->items[k];
       cluster_count += s->count;
-      // Select centroid by count.
-      if (s->count > useq->count) {
-        // Count centroid edges.
-        int cnt = 0;
+      // skip blacklisted as centroid choice
+      if (s->blacklisted) continue;
+      // compute edge count
+      int cnt = 0;
+      if (s->matches != NULL) {
         gstack_t* matches;
         for (int j = 0; (matches = s->matches[j]) != TOWER_TOP; j++)
           cnt += matches->nitems;
-        // Store centroid at index 0.
-        cluster->items[0] = s;
-        cluster->items[k] = useq;
-        useq = s;
-        // Save centroid edge count.
-        edge_count = cnt;
       }
-      // If same count, select by edge count.
-      else if (s->count == useq->count && s->matches != NULL) {
-        int cnt = 0;
-        gstack_t* matches;
-        for (int j = 0; (matches = s->matches[j]) != TOWER_TOP; j++)
-          cnt += matches->nitems;
-        if (cnt > edge_count) {
-          // Store centroid at index 0.
-          cluster->items[0] = s;
-          cluster->items[k] = useq;
-          useq = s;
-          // Save centroid edge count.
-          edge_count = cnt;
-        }
+      if (centroid == NULL || s->count > centroid->count ||
+          (s->count == centroid->count && cnt > centroid_edges)) {
+        centroid = s;
+        centroid_edges = cnt;
       }
     }
-    useq->count = cluster_count;
-    // Store cluster.
-    push(cluster, &clusters);
-  }
+    // If no non-blacklisted centroid found, leave centroid NULL (no canonical)
+    if (centroid != NULL) {
+      // put centroid at index 0
+      if (cluster->items[0] != centroid) {
+        for (size_t k = 1; k < cluster->nitems; k++)
+          if (cluster->items[k] == centroid) {
+            cluster->items[k] = cluster->items[0];
+            cluster->items[0] = centroid;
+            break;
+          }
+      }
+      centroid->canonical = centroid;
+      centroid->count = cluster_count;
+    } else {
+      // No canonical for this cluster; still store total count on first item
+      ((useq_t*)cluster->items[0])->count = cluster_count;
+    }
+
+    // Reset visited flags for this cluster so other algorithms can rely on visited cleared
+    for (size_t k = 0; k < cluster->nitems; k++)
+      ((useq_t*)cluster->items[k])->visited = 0;
+     // Store cluster.
+     push(cluster, &clusters);
+   }
 
   // Sort clusters by size (counts).
   qsort(
@@ -1185,8 +1234,8 @@ sphere_clustering(gstack_t* useqS) {
 
   for (size_t i = 0; i < useqS->nitems; i++) {
     useq_t* useq = (useq_t*)useqS->items[i];
-    if (useq->canonical != NULL)
-      continue;
+    if (useq->canonical != NULL || useq->blacklisted)
+       continue;
     useq->canonical = useq;
     useq->sphere_c = useq->count;
     useq->sphere_d = 0;
@@ -1906,9 +1955,6 @@ transfer_sorted_useq_ids(useq_t* ud, useq_t* us)
 
 void
 transfer_counts_and_update_canonicals(useq_t* useq)
-// TODO: Write the doc.
-// SYNOPSIS:
-//   Function used in message passing clustering.
 {
   // Ambiguous flag set, skip.
   if (useq->sphere_d) {
@@ -1918,7 +1964,10 @@ transfer_counts_and_update_canonicals(useq_t* useq)
   // If the read has no matches, it has no parent, so
   // it is an ancestor and it must be canonical.
   if (useq->matches == NULL) {
-    useq->canonical = useq;
+    if (!useq->blacklisted)
+      useq->canonical = useq;
+    else
+      useq->canonical = NULL;
     return;
   }
 
@@ -1952,15 +2001,17 @@ transfer_counts_and_update_canonicals(useq_t* useq)
 
   // Self canonical is the canonical of the first parent...
   useq_t* canonical = ((useq_t*)matches->items[0])->canonical;
-  // ... but if parents have different canonicals then
-  // self canonical is set to 'NULL'. (ambiguous)
-  for (size_t i = 1; i < matches->nitems; i++) {
-    useq_t* match = (useq_t*)matches->items[i];
-    if (match->canonical == NULL || match->canonical != canonical) {
-      canonical = NULL;
-      break;
-    }
-  }
+  if (canonical != NULL && canonical->blacklisted)
+    canonical = NULL;
+   // ... but if parents have different canonicals then
+   // self canonical is set to 'NULL'. (ambiguous)
+   for (size_t i = 1; i < matches->nitems; i++) {
+     useq_t* match = (useq_t*)matches->items[i];
+    if (match->canonical == NULL || match->canonical != canonical || (match->canonical && match->canonical->blacklisted)) {
+       canonical = NULL;
+       break;
+     }
+   }
 
   // Set canonical and transfer counts and ids.
   if (canonical) {
@@ -2012,20 +2063,20 @@ mp_resolve_ambiguous(useq_t* useq) {
   int ssz_max = 0;
   for (size_t i = 0; i < matches->nitems; i++) {
     useq_t* match = (useq_t*)matches->items[i];
-    if (match->canonical == match) {
-      if (match->count > cnt_max) {
-        canonical = match;
-        cnt_max = canonical->count;
-        ssz_max = canonical->sphere_c;
-      }
-      // Same count, compare sphere size.
-      else if (match->count == cnt_max && match != canonical) {
-        if (match->sphere_c > ssz_max) {
-          canonical = match;
-          ssz_max = canonical->sphere_c;
-        } else if (match->sphere_c == ssz_max)
-          canonical = NULL;
-      }
+    if (match->canonical == match && !match->blacklisted) {
+       if (match->count > cnt_max) {
+         canonical = match;
+         cnt_max = canonical->count;
+         ssz_max = canonical->sphere_c;
+       }
+       // Same count, compare sphere size.
+       else if (match->count == cnt_max && match != canonical) {
+         if (match->sphere_c > ssz_max) {
+           canonical = match;
+           ssz_max = canonical->sphere_c;
+         } else if (match->sphere_c == ssz_max)
+           canonical = NULL;
+       }
     }
   }
 
@@ -2034,6 +2085,7 @@ mp_resolve_ambiguous(useq_t* useq) {
     cnt_max = 0;
     for (size_t i = 0; i < matches->nitems; i++) {
       useq_t* match_canon = ((useq_t*)matches->items[i])->canonical;
+      if (match_canon == NULL || match_canon->blacklisted) continue;
       if (match_canon->count > cnt_max) {
         cnt_max = match_canon->count;
         canonical = match_canon;
@@ -2248,6 +2300,8 @@ new_useq(int count, char* seq, char* info) {
   new->sphere_c = 0;
   new->sphere_d = 0;
   new->seqid = NULL;
+  new->blacklisted = blacklist_contains(new->seq);
+  new->matches = 0;  
   if (info != NULL) {
     new->info = strdup(info);
     if (new->info == NULL) {
