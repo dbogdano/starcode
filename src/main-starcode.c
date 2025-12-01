@@ -275,11 +275,12 @@ main(
 
       case 'a':
          if (allow_pattern == NULL) {
-            allow_pattern = strdup(optarg);
-            if (allow_pattern == NULL) { 
-               fprintf(stderr, "%s memory allocation error\n", ERRM);
+            allow_pattern = malloc(strlen(optarg) + 1);
+            if (allow_pattern == NULL) {
+               fprintf(stderr, "%s out of memory allocating allow-pattern\n", ERRM);
                return EXIT_FAILURE;
             }
+            strcpy(allow_pattern, optarg);
             fprintf(stderr, "debug: allow-pattern set to '%s'\n", allow_pattern);
          } else {
             fprintf(stderr, "%s --allow set more than once\n", ERRM);
