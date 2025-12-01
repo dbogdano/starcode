@@ -62,6 +62,14 @@ static const int valid_DNA_char[256] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0};
 
 static const char capitalize[128] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
@@ -236,6 +244,9 @@ static double CLUSTER_RATIO = 5.0;         // min parent/child ratio
 static gstack_t* BLACKLIST = NULL;
 // Optional IUPAC allow pattern (Uppercase)
 static char* ALLOW_PATTERN = NULL;
+
+// NEW: only allocate per-read seqid arrays when needed
+static int NEED_SEQIDS = 0; /* set in starcode() from CLI flags */
 
 void head_default(useq_t* u, propt_t propt) {
   useq_t* cncal = u->canonical;
@@ -510,30 +521,32 @@ starcode(                // Public
     double parent_to_child,  // Merging threshold
     const int showclusters,  // Print cluster members
     const int showids,       // Print sequence ID numbers
-    const int outputt,       // Output type (format)
-    FILE* blacklistf,         // Blacklist file
-    const char* allow_pattern // Allow pattern
+    const int outputt,        // Output type (format)
+    FILE* blacklistf,
+    const char* allow_pattern
 )
-// SYNOPSIS:
-//   Performs all-pairs sequence clustering.
 {
   OUTPUTF1 = outputf1;
   OUTPUTF2 = outputf2;
   OUTPUTT = outputt;
   CLUSTERALG = clusteralg;
   CLUSTER_RATIO = parent_to_child;
- 
-// Load blacklist before reading sequences so new_useq() can mark them.
-if (blacklistf != NULL) {
-  if (verbose) fprintf(stderr, "loading blacklist\n");
-  load_blacklist(blacklistf);
-}
-/* Apply allow-pattern provided from main() so new_useq() can use it. */
-if (allow_pattern != NULL) {
-  set_allow_pattern(allow_pattern);
-  if (verbose)
-    fprintf(stderr, "debug: starcode: allow-pattern='%s'\n", allow_pattern);
-}
+
+  /* decide whether to keep per-read IDs */
+  NEED_SEQIDS = showids || (OUTPUTT == TIDY_OUTPUT);
+  /* if you want explicit CLI override (e.g. --no-ids), apply it here */
+
+  // Load blacklist before reading sequences so new_useq() can mark them.
+  if (blacklistf != NULL) {
+    if (verbose) fprintf(stderr, "loading blacklist\n");
+    load_blacklist(blacklistf);
+  }
+  /* Apply allow-pattern provided from main() so new_useq() can use it. */
+  if (allow_pattern != NULL) {
+    set_allow_pattern(allow_pattern);
+    if (verbose)
+      fprintf(stderr, "debug: starcode: allow-pattern='%s'\n", allow_pattern);
+  }
 
   if (verbose) {
     fprintf(stderr, "running %s (last revised %s) with %d thread%s\n",
@@ -1570,13 +1583,15 @@ read_rawseq(FILE* inputf, gstack_t* uSQ) {
       alert();
       krash();
     }
-    new->nids = 1;
-    new->seqid = malloc(sizeof(int));
-    if (new->seqid == NULL) {
-      alert();
-      krash();
-    }
-    new->seqid[0] = uSQ->nitems + 1;
++    if (NEED_SEQIDS) {
++      new->nids = 1;
++      new->seqid = malloc(sizeof(int));
++      if (new->seqid == NULL) { alert(); krash(); }
++      new->seqid[0] = uSQ->nitems + 1;
++    } else {
++      new->nids = 0;
++      new->seqid = NULL;
++    }
     push(new, &uSQ);
   }
 
@@ -1627,13 +1642,15 @@ read_fasta(FILE* inputf, gstack_t* uSQ) {
         free(header);
         header = NULL;
       }
-      new->nids = 1;
-      new->seqid = malloc(sizeof(int));
-      if (new->seqid == NULL) {
-        alert();
-        krash();
-      }
-      new->seqid[0] = uSQ->nitems + 1;
++      if (NEED_SEQIDS) {
++        new->nids = 1;
++        new->seqid = malloc(sizeof(int));
++        if (new->seqid == NULL) { alert(); krash(); }
++        new->seqid[0] = uSQ->nitems + 1;
++      } else {
++        new->nids = 0;
++        new->seqid = NULL;
++      }
       push(new, &uSQ);
     } else if (readh) {
       header = strdup(line);
@@ -1702,13 +1719,16 @@ read_fastq(FILE* inputf, gstack_t* uSQ) {
         alert();
         krash();
       }
-      new->nids = 1;
-      new->seqid = malloc(sizeof(int));
-      if (new->seqid == NULL) {
-        alert();
-        krash();
+
+      if (NEED_SEQIDS) {
+        new->nids = 1;
+        new->seqid = malloc(sizeof(int));
+        if (new->seqid == NULL) { alert(); krash(); }
+        new->seqid[0] = uSQ->nitems + 1;
+      } else {
+        new->nids = 0;
+        new->seqid = NULL;
       }
-      new->seqid[0] = uSQ->nitems + 1;
       push(new, &uSQ);
     }
   }
@@ -1823,13 +1843,16 @@ read_PE_fastq(FILE* inputf1, FILE* inputf2, gstack_t* uSQ) {
         alert();
         krash();
       }
-      new->nids = 1;
-      new->seqid = malloc(sizeof(int));
-      if (new->seqid == NULL) {
-        alert();
-        krash();
+
+      if (NEED_SEQIDS) {
+        new->nids = 1;
+        new->seqid = malloc(sizeof(int));
+        if (new->seqid == NULL) { alert(); krash(); }
+        new->seqid[0] = uSQ->nitems + 1;
+      } else {
+        new->nids = 0;
+        new->seqid = NULL;
       }
-      new->seqid[0] = uSQ->nitems + 1;
       push(new, &uSQ);
     }
   }
