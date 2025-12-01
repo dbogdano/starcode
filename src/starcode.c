@@ -1571,15 +1571,15 @@ read_rawseq(FILE* inputf, gstack_t* uSQ) {
       alert();
       krash();
     }
-+    if (NEED_SEQIDS) {
-+      new->nids = 1;
-+      new->seqid = malloc(sizeof(int));
-+      if (new->seqid == NULL) { alert(); krash(); }
-+      new->seqid[0] = uSQ->nitems + 1;
-+    } else {
-+      new->nids = 0;
-+      new->seqid = NULL;
-+    }
+    if (NEED_SEQIDS) {
+      new->nids = 1;
+      new->seqid = malloc(sizeof(int));
+      if (new->seqid == NULL) { alert(); krash(); }
+      new->seqid[0] = uSQ->nitems + 1;
+    } else {
+      new->nids = 0;
+      new->seqid = NULL;
+    }
     push(new, &uSQ);
   }
 
