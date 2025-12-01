@@ -522,6 +522,8 @@ starcode(                // Public
 
   /* decide whether to keep per-read IDs */
   NEED_SEQIDS = showids || (OUTPUTT == TIDY_OUTPUT);
+  /* Inform user on stdout whether per-read seq-ids will be stored */
+  printf("NEED_SEQIDS: %s\n", NEED_SEQIDS ? "ON" : "OFF");
   /* if you want explicit CLI override (e.g. --no-ids), apply it here */
 
   // Load blacklist before reading sequences so new_useq() can mark them.
