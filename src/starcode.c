@@ -109,6 +109,7 @@ struct useq_t {
   int* seqid;          // Unique ID / pointer (see above).
   char blacklisted;    // If set, sequence cannot be canonical centroid
   char visited;        // Internal visited flag for DFS (connected components)
+  double mean_quality; // Mean quality score (0.0-40.0); -1.0 if not set
 };
 
 struct lookup_t {
@@ -495,6 +496,26 @@ int iupac_matches(const char* pattern, const char* seq) {
   return 1;
 }
 
+// Compute mean quality score from FASTQ quality string (Phred scale).
+// Assumes ASCII quality encoding (Phred+33 standard).
+// Returns -1.0 if qual_str is NULL or empty.
+static double
+compute_mean_quality(const char* qual_str) {
+  if (qual_str == NULL || strlen(qual_str) == 0)
+    return -1.0;
+  double sum = 0.0;
+  size_t count = 0;
+  for (size_t i = 0; qual_str[i] != '\0'; ++i) {
+    // Phred: Q = -10 log10(P); ASCII 33 ('!') = Q0, ASCII 73 ('I') = Q40
+    // More typically: ASCII 33-126 maps to Q 0-93
+    int q = (int)qual_str[i] - 33;
+    if (q < 0) q = 0;
+    if (q > 93) q = 93;  // cap at max Illumina quality
+    sum += q;
+    count++;
+  }
+  return count > 0 ? sum / count : -1.0;
+}
 
 int 
 starcode(                // Public
@@ -1506,12 +1527,26 @@ nukesort(void* args)
 
     if (cmp == 0) {
       // Identical sequences, this is the "nuke" part.
-      // Add sequence counts.
-      ul->count += ur->count;
-      transfer_useq_ids(ul, ur);
-      destroy_useq(ur);
-      buf[idx++] = l[i++];
-      j++;
+      useq_t* ul = (useq_t*)l[i];
+      useq_t* ur = (useq_t*)r[j];
+      
+      // NEW: prefer high-quality sequence as representative.
+      // If right has better quality, promote it; otherwise use left (first seen).
+      if (ur->mean_quality > ul->mean_quality && ur->mean_quality >= 0) {
+        // Use right as representative
+        ur->count += ul->count;
+        transfer_useq_ids(ur, ul);
+        destroy_useq(ul);
+        buf[idx++] = r[j++];
+        i++;
+      } else {
+        // Use left as representative
+        ul->count += ur->count;
+        transfer_useq_ids(ul, ur);
+        destroy_useq(ur);
+        buf[idx++] = l[i++];
+        j++;
+      }
       repeats++;
     } else if (cmp < 0)
       buf[idx++] = l[i++];
@@ -1657,6 +1692,7 @@ read_fasta(FILE* inputf, gstack_t* uSQ) {
   return uSQ;
 }
 
+// Step 4: Modify read_fastq to capture and set quality
 gstack_t*
 read_fastq(FILE* inputf, gstack_t* uSQ) {
   ssize_t nread;
@@ -1669,6 +1705,7 @@ read_fastq(FILE* inputf, gstack_t* uSQ) {
 
   char seq[M + 1] = {0};
   char header[M + 1] = {0};
+  char quality[M + 1] = {0};  // NEW: store quality string
   char info[2 * M + 2] = {0};
   size_t lineno = 0;
 
@@ -1696,9 +1733,14 @@ read_fastq(FILE* inputf, gstack_t* uSQ) {
         }
       }
       strncpy(seq, line, M);
+    } else if (lineno % 4 == 3) {
+      // NEW: quality separator line, skip (usually just '+')
+      continue;
     } else if (lineno % 4 == 0) {
+      // NEW: capture quality string
+      strncpy(quality, line, M);
       if (readh) {
-        int status = snprintf(info, 2 * M + 2, "%s\n%s", header, line);
+        int status = snprintf(info, 2 * M + 2, "%s\n%s", header, quality);
         if (status < 0 || status > 2 * M - 1) {
           alert();
           krash();
@@ -1709,6 +1751,8 @@ read_fastq(FILE* inputf, gstack_t* uSQ) {
         alert();
         krash();
       }
+      // NEW: compute and store mean quality for this sequence
+      new->mean_quality = compute_mean_quality(quality);
 
       if (NEED_SEQIDS) {
         new->nids = 1;
@@ -1811,6 +1855,9 @@ read_PE_fastq(FILE* inputf1, FILE* inputf2, gstack_t* uSQ) {
         int scheck = snprintf(
             info, 4 * M, "%s\n%s\n%s\n%s", header1, line1, header2, line2);
         if (scheck < 0 || scheck > 4 * M - 1) {
+
+
+
           alert();
           krash();
         }
@@ -2392,14 +2439,9 @@ new_useq(int count, char* seq, char* info) {
   new->sphere_c = 0;
   new->sphere_d = 0;
   new->seqid = NULL;
-  // Blacklisted if present in file blacklist OR if an allow-pattern is set and the seq does not match it.
-  new->matches = 0;  
-  if (BLACKLIST && blacklist_contains(new->seq))
-    new->blacklisted = 1;
-  if (ALLOW_PATTERN && !iupac_matches(ALLOW_PATTERN, new->seq))
-    new->blacklisted = 1;
-  new->matches = 0;
-
+  new->blacklisted = blacklist_contains(new->seq);
+  new->visited = 0;
+  new->mean_quality = -1.0;  // not set by default; will be updated by readers
   if (info != NULL) {
     new->info = strdup(info);
     if (new->info == NULL) {
