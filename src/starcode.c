@@ -570,6 +570,9 @@ starcode(                // Public
     return 1;
   }
 
+  /* Apply allow-pattern AFTER reading but BEFORE padding/sorting. */
+  apply_allow_pattern(uSQ);
+
   /* Debug, count how many sequences were marked blacklisted at the read time*/
   if (verbose) {
     size_t bc = 0;
@@ -2440,8 +2443,9 @@ new_useq(int count, char* seq, char* info) {
   new->sphere_d = 0;
   new->seqid = NULL;
   new->blacklisted = blacklist_contains(new->seq);
+  // NEW: pattern check moved to after reading; don't check here
   new->visited = 0;
-  new->mean_quality = -1.0;  // not set by default; will be updated by readers
+  new->mean_quality = -1.0;
   if (info != NULL) {
     new->info = strdup(info);
     if (new->info == NULL) {
