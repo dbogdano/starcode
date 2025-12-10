@@ -219,6 +219,7 @@ void transfer_sorted_useq_ids(useq_t*, useq_t*);
 void transfer_useq_ids(useq_t*, useq_t*);
 void unpad_useq(gstack_t*);
 void* nukesort(void*);
+void apply_allow_pattern(gstack_t*);  // NEW: forward declaration
 
 //    Global variables    //
 static FILE* OUTPUTF1 = NULL;              // output file 1
