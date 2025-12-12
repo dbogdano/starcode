@@ -131,10 +131,8 @@ void apply_allow_pattern(gstack_t* uSQ) {
 
   for (size_t i = 0; i < uSQ->nitems; ++i) {
     useq_t* u = (useq_t*)uSQ->items[i];
-    if (u != NULL && u->seq != NULL) {
-      if (!iupac_matches(ALLOW_PATTERN, u->seq)) {
-        u->blacklisted = 1;
-      }
+    if (u && u->seq && !iupac_matches(ALLOW_PATTERN, u->seq)) {
+      u->blacklisted = 1;
     }
   }
 }
