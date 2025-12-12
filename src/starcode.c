@@ -622,7 +622,7 @@ starcode(                // Public
   for (int i = 0 ; i < mtplan->ntries ; i++) {
     free(mtplan->tries[i].jobs->node_pos);
     free(mtplan->tries[i].jobs->lut);
-    free(mtplan->tries[i].jobs->trie);
+    free(mtplan->tries[i].
     free(mtplan->tries[i].jobs);
   }
   free(mtplan->tries);
@@ -2603,4 +2603,16 @@ krash(void) {
       "starcode has crashed, please contact guillaume.filion@gmail.com "
       "for support with this issue.\n");
   abort();
+}
+
+// Apply ALLOW_PATTERN: mark sequences that don't match as blacklisted
+void apply_allow_pattern(gstack_t* uSQ) {
+  if (ALLOW_PATTERN == NULL || uSQ == NULL) return;
+
+  for (size_t i = 0; i < uSQ->nitems; ++i) {
+    useq_t* u = (useq_t*)uSQ->items[i];
+    if (u && u->seq && !iupac_matches(ALLOW_PATTERN, u->seq)) {
+      u->blacklisted = 1;
+    }
+  }
 }
