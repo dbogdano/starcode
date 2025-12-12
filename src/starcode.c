@@ -622,7 +622,6 @@ starcode(                // Public
   for (int i = 0 ; i < mtplan->ntries ; i++) {
     free(mtplan->tries[i].jobs->node_pos);
     free(mtplan->tries[i].jobs->lut);
-    free(mtplan->tries[i].
     free(mtplan->tries[i].jobs);
   }
   free(mtplan->tries);
