@@ -125,6 +125,21 @@ outname
 }
 
 
+// Apply ALLOW_PATTERN: mark sequences that don't match as blacklisted
+void apply_allow_pattern(gstack_t* uSQ) {
+  if (ALLOW_PATTERN == NULL || uSQ == NULL) return;
+
+  for (size_t i = 0; i < uSQ->nitems; ++i) {
+    useq_t* u = (useq_t*)uSQ->items[i];
+    if (u != NULL && u->seq != NULL) {
+      if (!iupac_matches(ALLOW_PATTERN, u->seq)) {
+        u->blacklisted = 1;
+      }
+    }
+  }
+}
+
+
 int
 main(
    int argc,
