@@ -2510,60 +2510,28 @@ int
 count_order_spheres(const void* a, const void* b) {
   useq_t* u1 = *((useq_t**)a);
   useq_t* u2 = *((useq_t**)b);
-  
-  // Compute quality-weighted counts
-  // If quality is invalid (<0), use a penalty factor (e.g., 0.5)
-  double weight1 = (u1->mean_quality >= 0) ? (u1->mean_quality / 40.0) : 0.5;
-  double weight2 = (u2->mean_quality >= 0) ? (u2->mean_quality / 40.0) : 0.5;
-  
-  // Apply minimum quality threshold to heavily penalize low quality
-  // Sequences with quality < 20 get heavily downweighted
-  if (u1->mean_quality >= 0 && u1->mean_quality < 20.0) {
-    weight1 *= 0.1;  // 90% penalty for low quality
-  }
-  if (u2->mean_quality >= 0 && u2->mean_quality < 20.0) {
-    weight2 *= 0.1;
-  }
-  
-  double weighted_count1 = u1->count * weight1;
-  double weighted_count2 = u2->count * weight2;
-  
-  // Sort by weighted count (higher is better, so reverse for qsort)
-  if (weighted_count1 != weighted_count2) {
-    return weighted_count1 < weighted_count2 ? 1 : -1;
-  }
-  
-  // If weighted counts equal, sort by cluster size
-  if (u2->matches == NULL)
-    return -1;
-  if (u1->matches == NULL)
-    return 1;
+  // Same count, sort by cluster size.
+  if (u1->count == u2->count) {
+    if (u2->matches == NULL)
+      return -1;
+    if (u1->matches == NULL)
+      return 1;
 
-  long cnt1 = 0, cnt2 = 0;
-  gstack_t* matches;
-  for (int j = 0; (matches = u1->matches[j]) != TOWER_TOP; j++)
-    for (size_t k = 0; k < matches->nitems; k++)
-      cnt1 += ((useq_t*)matches->items[k])->count;
+    // This counts the whole cluster size because the edge
+    // references are bidirectional in spheres clustering.
+    long cnt1 = 0, cnt2 = 0;
+    gstack_t* matches;
+    for (int j = 0; (matches = u1->matches[j]) != TOWER_TOP; j++)
+      for (size_t k = 0; k < matches->nitems; k++)
+        cnt1 += ((useq_t*)matches->items[k])->count;
 
-  for (int j = 0; (matches = u2->matches[j]) != TOWER_TOP; j++)
-    for (size_t k = 0; k < matches->nitems; k++)
-      cnt2 += ((useq_t*)matches->items[k])->count;
+    for (int j = 0; (matches = u2->matches[j]) != TOWER_TOP; j++)
+      for (size_t k = 0; k < matches->nitems; k++)
+        cnt2 += ((useq_t*)matches->items[k])->count;
 
-  // Apply quality weighting to cluster sizes too
-  double weighted_cluster1 = cnt1 * weight1;
-  double weighted_cluster2 = cnt2 * weight2;
-  
-  if (weighted_cluster1 != weighted_cluster2) {
-    return weighted_cluster1 < weighted_cluster2 ? 1 : -1;
-  }
-  
-  // Final tiebreaker: raw quality
-  if (u1->mean_quality > u2->mean_quality && u1->mean_quality >= 0)
-    return -1;
-  if (u2->mean_quality > u1->mean_quality && u2->mean_quality >= 0)
-    return 1;
-    
-  return 0;
+    return cnt1 < cnt2 ? 1 : -1;
+  } else
+    return u1->count < u2->count ? 1 : -1;
 }
 
 int
