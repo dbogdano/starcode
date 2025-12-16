@@ -184,7 +184,7 @@ void connected_components(useq_t*, gstack_t**);
 long int count_trie_nodes(useq_t**, int, int);
 int sphere_size_order(const void*, const void*);
 int count_order(const void*, const void*);
-static int count_order_spheres(const void*, const void*);
+int count_order_spheres(const void*, const void*);
 void destroy_useq(useq_t*);
 void destroy_lookup(lookup_t*);
 void* do_query(void*);
@@ -1844,7 +1844,6 @@ read_fastq(FILE* inputf, gstack_t* uSQ) {
       } else {
         new->nids = 0;
         new->seqid = NULL;
-      }
       push(new, &uSQ);
     }
   }
@@ -2584,3 +2583,1243 @@ count_order(const void* a, const void* b) {
   else
     return u1->count < u2->count ? 1 : -1;
 }
+
+// MODIFIED count_order_spheres with quality-aware weighting
+// Quality penalizes low-quality barcodes from becoming centroids
+static int
+count_order_spheres(const void* a, const void* b) {
+  useq_t* u1 = *((useq_t**)a);
+  useq_t* u2 = *((useq_t**)b);
+  
+  // Calculate quality-weighted counts
+  // If quality < 20.0 (Phred score), apply 0.5x penalty
+  // Otherwise, apply quality_boost = (quality / 40.0)
+  double weight1 = 1.0;
+  double weight2 = 1.0;
+  
+  if (u1->mean_quality > 0) {
+    if (u1->mean_quality < 20.0) {
+      weight1 = 0.5;  // Hard penalty for poor quality
+    } else {
+      weight1 = (u1->mean_quality / 40.0);  // Boost for high quality
+    }
+  }
+  
+  if (u2->mean_quality > 0) {
+    if (u2->mean_quality < 20.0) {
+      weight2 = 0.5;  // Hard penalty for poor quality
+    } else {
+      weight2 = (u2->mean_quality / 40.0);  // Boost for high quality
+    }
+  }
+  
+  long weighted_count1 = (long)(u1->count * weight1);
+  long weighted_count2 = (long)(u2->count * weight2);
+  
+  // Sort by weighted count (descending)
+  if (weighted_count1 != weighted_count2) {
+    return weighted_count1 < weighted_count2 ? 1 : -1;
+  }
+  
+  // Same weighted count, sort by cluster size
+  if (u1->matches == NULL && u2->matches == NULL)
+    return 0;
+  if (u2->matches == NULL)
+    return -1;
+  if (u1->matches == NULL)
+    return 1;
+
+  long cnt1 = 0, cnt2 = 0;
+  gstack_t* matches;
+  for (int j = 0; (matches = u1->matches[j]) != TOWER_TOP; j++)
+    for (size_t k = 0; k < matches->nitems; k++)
+      cnt1 += ((useq_t*)matches->items[k])->count;
+
+  for (int j = 0; (matches = u2->matches[j]) != TOWER_TOP; j++)
+    for (size_t k = 0; k < matches->nitems; k++)
+      cnt2 += ((useq_t*)matches->items[k])->count;
+
+  return cnt1 < cnt2 ? 1 : -1;
+}
+
+// MODIFIED sphere_clustering with quality-aware sequence stealing
+void
+sphere_clustering(gstack_t* useqS) {
+  // Sort in quality-weighted count order
+  qsort(useqS->items, useqS->nitems, sizeof(useq_t*), count_order_spheres);
+
+  for (size_t i = 0; i < useqS->nitems; i++) {
+    useq_t* useq = (useq_t*)useqS->items[i];
+    if (useq->canonical != NULL || useq->blacklisted)
+       continue;
+    useq->canonical = useq;
+    useq->sphere_c = useq->count;
+    useq->sphere_d = 0;
+    if (useq->matches == NULL)
+      continue;
+    
+    // Bidirectional edge references simplify the algorithm.
+    // Directly proceed to claim neighbor counts.
+    gstack_t* matches;
+    for (int j = 0; (matches = useq->matches[j]) != TOWER_TOP; j++) {
+      for (size_t k = 0; k < matches->nitems; k++) {
+        useq_t* match = (useq_t*)matches->items[k];
+        
+        // If a sequence has been already claimed, decide whether to steal it
+        if (match->canonical != NULL) {
+          // Steal sequence from the other sphere if EITHER:
+          // 1. It is closer (lower distance), OR
+          // 2. It is equidistant AND this centroid has better quality
+          int should_steal = 0;
+          
+          if (j < match->sphere_d) {
+            // Closer distance - always steal
+            should_steal = 1;
+          } else if (j == match->sphere_d) {
+            // Equidistant - check quality difference
+            // Only steal if quality difference is significant (>5 points)
+            // AND this centroid has better quality
+            if (useq->mean_quality > 0 && match->canonical->mean_quality > 0) {
+              if (useq->mean_quality - match->canonical->mean_quality > 5.0) {
+                should_steal = 1;
+              }
+            }
+          }
+          
+          if (should_steal) {
+            // Update other sphere size
+            match->canonical->sphere_c -= match->count;
+          } else {
+            matches->items[k--] = matches->items[--matches->nitems];
+            continue;
+          }
+        }
+        
+        // Claim the sequence
+        useq->sphere_c += match->count;
+        match->canonical = useq;
+        match->sphere_d = j;
+      }
+    }
+  }
+
+  return;
+}
+
+void
+message_passing_clustering(gstack_t* useqS) {
+  // Transfer counts to parents recursively.
+  for (size_t i = 0; i < useqS->nitems; i++) {
+    useq_t* u = (useq_t*)useqS->items[i];
+    transfer_counts_and_update_canonicals(u);
+  }
+
+  // Resolve ambiguous assignments.
+  for (size_t i = 0; i < useqS->nitems; i++) {
+    useq_t* u = (useq_t*)useqS->items[i];
+    mp_resolve_ambiguous(u);
+  }
+
+  return;
+}
+
+size_t
+seqsort(useq_t** data, size_t numels, int thrmax)
+// SYNOPSIS:
+//   Recursive merge sort for 'useq_t' arrays, tailored for the
+//   problem of sorting merging identical sequences. When two
+//   identical sequences are detected during the sort, they are
+//   merged into a single one with more counts, and one of them
+//   is destroyed (freed). See 'nukesort()' for a description of
+//   the sort order.
+//
+// PARAMETERS:
+//   data:       an array of pointers to each element.
+//   numels:     number of elements, i.e. size of 'data'.
+//   thrmax: number of threads.
+//
+// RETURN:
+//   Number of unique elements.
+//
+// SIDE EFFECTS:
+//   Pointers to repeated elements are set to NULL.
+{
+  // Copy to buffer.
+  useq_t** buffer = calloc(numels, sizeof(useq_t*));
+  memcpy(buffer, data, numels * sizeof(useq_t*));
+
+  // Prepare args struct.
+  sortargs_t args;
+  args.buf0 = data;
+  args.buf1 = buffer;
+  args.size = numels;
+  // There are two alternating buffers for the merge step.
+  // 'args.b' alternates on every call to 'nukesort()' to
+  // keep track of which is the source and which is the
+  // destination. It has to be initialized to 0 so that
+  // sorted elements end in 'data' and not in 'buffer'.
+  args.b = 0;
+  args.thread = 0;
+  args.repeats = 0;
+
+  // Allocate a number of threads that is a power of 2.
+  while ((thrmax >> (args.thread + 1)) > 0)
+    args.thread++;
+
+  nukesort(&args);
+
+  free(buffer);
+  return numels - args.repeats;
+}
+
+void*
+nukesort(void* args)
+// SYNOPSIS:
+//   Recursive part of 'seqsort'. The code of 'nukesort()' is
+//   dangerous and should not be reused. It uses a very special
+//   sort order designed for starcode, it destroys some elements
+//   and sets them to NULL as it sorts. The sort order is based
+//   on the sequences and is such that a < b if a is shorter
+//   than b or if a has the same length as b and lower lexical
+//   order. When a is the same as b, the useq containing b is
+//   destroyed (freed) and replaced by NULL.
+//
+// ARGUMENTS:
+//   args: a sortargs_t struct (see private header file).
+//
+// RETURN:
+//   NULL pointer, regardless of the input
+//
+// SIDE EFFECTS:
+//   Sorts the array of 'useq_t' specified in 'args'.
+{
+  sortargs_t* sortargs = (sortargs_t*)args;
+  if (sortargs->size < 2)
+    return NULL;
+
+  // Next level params.
+  sortargs_t arg1 = *sortargs, arg2 = *sortargs;
+  arg1.size /= 2;
+  arg2.size = arg1.size + arg2.size % 2;
+  arg2.buf0 += arg1.size;
+  arg2.buf1 += arg1.size;
+  arg1.b = arg2.b = (arg1.b + 1) % 2;
+
+  // Either run threads or DIY.
+  if (arg1.thread) {
+    // Decrease one level.
+    arg1.thread = arg2.thread = arg1.thread - 1;
+    // Create threads.
+    pthread_t thread1, thread2;
+    if (pthread_create(&thread1, NULL, nukesort, &arg1) ||
+        pthread_create(&thread2, NULL, nukesort, &arg2)) {
+      alert();
+      krash();
+    }
+    // Wait for threads.
+    pthread_join(thread1, NULL);
+    pthread_join(thread2, NULL);
+  } else {
+    nukesort(&arg1);
+    nukesort(&arg2);
+  }
+
+  // Separate data and buffer (b specifies which is buffer).
+  useq_t** l = (sortargs->b ? arg1.buf0 : arg1.buf1);
+  useq_t** r = (sortargs->b ? arg2.buf0 : arg2.buf1);
+  useq_t** buf = (sortargs->b ? arg1.buf1 : arg1.buf0);
+
+  ssize_t i = 0;
+  ssize_t j = 0;
+  ssize_t idx = 0;
+  ssize_t repeats = 0;
+  int cmp = 0;
+
+  // Merge sets
+  while (i + j < sortargs->size) {
+    // Only NULLs at the end of the buffers.
+    if (j == arg2.size || r[j] == NULL) {
+      // Right buffer is exhausted. Copy left buffer...
+      memcpy(buf + idx, l + i, (arg1.size - i) * sizeof(useq_t*));
+      break;
+    }
+    if (i == arg1.size || l[i] == NULL) {
+      // ... or vice versa.
+      memcpy(buf + idx, r + j, (arg2.size - j) * sizeof(useq_t*));
+      break;
+    }
+    if (l[i] == NULL && r[j] == NULL)
+      break;
+
+    // Do the comparison.
+    useq_t* ul = (useq_t*)l[i];
+    useq_t* ur = (useq_t*)r[j];
+    ssize_t sl = strlen(ul->seq);
+    ssize_t sr = strlen(ur->seq);
+    if (sl == sr)
+      cmp = strcmp(ul->seq, ur->seq);
+    else
+      cmp = sl < sr ? -1 : 1;
+
+    if (cmp == 0) {
+      // Identical sequences, this is the "nuke" part.
+      useq_t* ul = (useq_t*)l[i];
+      useq_t* ur = (useq_t*)r[j];
+      
+      // NEW: prefer high-quality sequence as representative.
+      // If right has better quality, promote it; otherwise use left (first seen).
+      if (ur->mean_quality > ul->mean_quality && ur->mean_quality >= 0) {
+        // Use right as representative
+        ur->count += ul->count;
+        transfer_useq_ids(ur, ul);
+        destroy_useq(ul);
+        buf[idx++] = r[j++];
+        i++;
+      } else {
+        // Use left as representative
+        ul->count += ur->count;
+        transfer_useq_ids(ul, ur);
+        destroy_useq(ur);
+        buf[idx++] = l[i++];
+        j++;
+      }
+      repeats++;
+    } else if (cmp < 0)
+      buf[idx++] = l[i++];
+    else
+      buf[idx++] = r[j++];
+  }
+
+  // Accumulate repeats
+  sortargs->repeats = repeats + arg1.repeats + arg2.repeats;
+
+  // Pad with NULLS.
+  ssize_t offset = sortargs->size - sortargs->repeats;
+  memset(buf + offset, 0, sortargs->repeats * sizeof(useq_t*));
+
+  return NULL;
+}
+
+gstack_t*
+read_rawseq(FILE* inputf, gstack_t* uSQ) {
+  ssize_t nread;
+  size_t nchar = M;
+  char copy[MAXBRCDLEN];
+  char* line = malloc(M);
+  if (line == NULL) {
+    alert();
+    krash();
+  }
+
+  char* seq = NULL;
+  int count = 0;
+  int lineno = 0;
+
+  while ((nread = getline(&line, &nchar, inputf)) != -1) {
+    if (nread > MAXBRCDLEN) {
+      // Could trigger an overflow in 'copy'.
+      fprintf(stderr, "max sequence length exceeded (%d)\n", MAXBRCDLEN);
+      fprintf(stderr, "offending line:\n%s\n", line);
+      abort();
+    }
+    lineno++;
+    if (line[nread - 1] == '\n')
+      line[nread - 1] = '\0';
+    if (sscanf(line, "%s\t%d", copy, &count) != 2) {
+      count = 1;
+      seq = line;
+    } else {
+      seq = copy;
+    }
+    size_t seqlen = strlen(seq);
+    for (size_t i = 0; i < seqlen; i++) {
+      if (!valid_DNA_char[(int)seq[i]]) {
+        fprintf(stderr, "invalid input\n");
+        fprintf(stderr, "offending sequence:\n%s\n", seq);
+        abort();
+      }
+    }
+    useq_t* new = new_useq(count, seq, NULL);
+    if (new == NULL) {
+      alert();
+      krash();
+    }
+    if (NEED_SEQIDS) {
+      new->nids = 1;
+      new->seqid = malloc(sizeof(int));
+      if (new->seqid == NULL) { alert(); krash(); }
+      new->seqid[0] = uSQ->nitems + 1;
+    } else {
+      new->nids = 0;
+      new->seqid = NULL;
+    }
+    push(new, &uSQ);
+  }
+
+  free(line);
+  return uSQ;
+}
+
+gstack_t*
+read_fasta(FILE* inputf, gstack_t* uSQ) {
+  ssize_t nread;
+  size_t nchar = M;
+  char* line = malloc(M);
+  if (line == NULL) {
+    alert();
+    krash();
+  }
+
+  char* header = NULL;
+  int lineno = 0;
+
+  int const readh = OUTPUTT == NRED_OUTPUT;
+  while ((nread = getline(&line, &nchar, inputf)) != -1) {
+    lineno++;
+    // Strip newline character.
+    if (line[nread - 1] == '\n')
+      line[nread - 1] = '\0';
+
+    if (lineno % 2 == 0) {
+      size_t seqlen = strlen(line);
+      if (seqlen > MAXBRCDLEN) {
+        fprintf(stderr, "max sequence length exceeded (%d)\n", MAXBRCDLEN);
+        fprintf(stderr, "offending sequence:\n%s\n", line);
+        abort();
+      }
+      for (size_t i = 0; i < seqlen; i++) {
+        if (!valid_DNA_char[(int)line[i]]) {
+          fprintf(stderr, "invalid input\n");
+          fprintf(stderr, "offending sequence:\n%s\n", line);
+          abort();
+        }
+      }
+      useq_t* new = new_useq(1, line, header);
+      if (new == NULL) {
+        alert();
+        krash();
+      }
+      if (header != NULL) {
+        free(header);
+        header = NULL;
+      }
+      if (NEED_SEQIDS) {
+        new->nids = 1;
+        new->seqid = malloc(sizeof(int));
+        if (new->seqid == NULL) { alert(); krash(); }
+        new->seqid[0] = uSQ->nitems + 1;
+      } else {
+        new->nids = 0;
+        new->seqid = NULL;
+      }
+      push(new, &uSQ);
+    } else if (readh) {
+      header = strdup(line);
+      if (header == NULL) {
+        alert();
+        krash();
+      }
+    }
+  }
+
+  if (header != NULL)
+    free(header);  // If number of lines is odd.
+  free(line);
+  return uSQ;
+}
+
+// Step 4: Modify read_fastq to capture and set quality
+gstack_t*
+read_fastq(FILE* inputf, gstack_t* uSQ) {
+  ssize_t nread;
+  size_t nchar = M;
+  char* line = malloc(M);
+  if (line == NULL) {
+    alert();
+    krash();
+  }
+
+  char seq[M + 1] = {0};
+  char header[M + 1] = {0};
+  char quality[M + 1] = {0};  // NEW: store quality string
+  char info[2 * M + 2] = {0};
+  size_t lineno = 0;
+
+  int const readh = OUTPUTT == NRED_OUTPUT;
+  while ((nread = getline(&line, &nchar, inputf)) != -1) {
+    lineno++;
+    // Strip newline character.
+    if (line[nread - 1] == '\n')
+      line[nread - 1] = '\0';
+
+    if (readh && lineno % 4 == 1) {
+      strncpy(header, line, M);
+    } else if (lineno % 4 == 2) {
+      size_t seqlen = strlen(line);
+      if (seqlen > MAXBRCDLEN) {
+        fprintf(stderr, "max sequence length exceeded (%d)\n", MAXBRCDLEN);
+        fprintf(stderr, "offending sequence:\n%s\n", line);
+        abort();
+      }
+      for (size_t i = 0; i < seqlen; i++) {
+        if (!valid_DNA_char[(int)line[i]]) {
+          fprintf(stderr, "invalid input\n");
+          fprintf(stderr, "offending sequence:\n%s\n", line);
+          abort();
+        }
+      }
+      strncpy(seq, line, M);
+    } else if (lineno % 4 == 3) {
+      // NEW: quality separator line, skip (usually just '+')
+      continue;
+    } else if (lineno % 4 == 0) {
+      // NEW: capture quality string
+      strncpy(quality, line, M);
+      if (readh) {
+        int status = snprintf(info, 2 * M + 2, "%s\n%s", header, quality);
+        if (status < 0 || status > 2 * M - 1) {
+          alert();
+          krash();
+        }
+      }
+      useq_t* new = new_useq(1, seq, info);
+      if (new == NULL) {
+        alert();
+        krash();
+      }
+      // NEW: compute and store mean quality for this sequence
+      new->mean_quality = compute_mean_quality(quality);
+
+      if (NEED_SEQIDS) {
+        new->nids = 1;
+        new->seqid = malloc(sizeof(int));
+        if (new->seqid == NULL) { alert(); krash(); }
+        new->seqid[0] = uSQ->nitems + 1;
+      } else {
+        new->nids = 0;
+        new->seqid = NULL;
+      }
+      push(new, &uSQ);
+    }
+  }
+
+  free(line);
+  return uSQ;
+}
+
+gstack_t*
+read_PE_fastq(FILE* inputf1, FILE* inputf2, gstack_t* uSQ) {
+  char c1 = fgetc(inputf1);
+  char c2 = fgetc(inputf2);
+  if (c1 != '@' || c2 != '@') {
+    fprintf(stderr, "input not a pair of fastq files\n");
+    abort();
+  }
+  if (ungetc(c1, inputf1) == EOF || ungetc(c2, inputf2) == EOF) {
+    alert();
+    krash();
+  }
+
+  ssize_t nread;
+  size_t nchar = M;
+  char* line1 = malloc(M);
+  char* line2 = malloc(M);
+  if (line1 == NULL && line2 == NULL) {
+    alert();
+    krash();
+  }
+
+  char seq1[M] = {0};
+  char seq2[M] = {0};
+  char seq[2 * M + 8] = {0};
+  char header1[M] = {0};
+  char header2[M] = {0};
+  char info[4 * M] = {0};
+  int lineno = 0;
+
+  int const readh = OUTPUTT == NRED_OUTPUT;
+  char sep[STARCODE_MAX_TAU + 2] = {0};
+  memset(sep, '-', STARCODE_MAX_TAU + 1);
+
+  while ((nread = getline(&line1, &nchar, inputf1)) != -1) {
+    lineno++;
+    // Strip newline character.
+    if (line1[nread - 1] == '\n')
+      line1[nread - 1] = '\0';
+
+    // Read line from second file and strip newline.
+    if ((nread = getline(&line2, &nchar, inputf2)) == -1) {
+      fprintf(stderr, "non conformable paired-end fastq files\n");
+      abort();
+    }
+    if (line2[nread - 1] == '\n')
+      line2[nread - 1] = '\0';
+
+    if (readh && lineno % 4 == 1) {
+      // No check that the headers match each other. At the
+      // time of this writing, there are already different
+      // formats to link paired-end record. We assume that
+      // the users know what they do.
+      strncpy(header1, line1, M-1);
+      strncpy(header2, line2, M-1);
+    } else if (lineno % 4 == 2) {
+      size_t seqlen1 = strlen(line1);
+      size_t seqlen2 = strlen(line2);
+      if (seqlen1 > MAXBRCDLEN || seqlen2 > MAXBRCDLEN) {
+        fprintf(stderr, "max sequence length exceeded (%d)\n", MAXBRCDLEN);
+        fprintf(stderr, "offending sequences:\n%s\n%s\n", line1, line2);
+        abort();
+      }
+      for (size_t i = 0; i < seqlen1; i++) {
+        if (!valid_DNA_char[(int)line1[i]]) {
+          fprintf(stderr, "invalid input\n");
+          fprintf(stderr, "offending sequence:\n%s\n", line1);
+          abort();
+        }
+      }
+      for (size_t i = 0; i < seqlen2; i++) {
+        if (!valid_DNA_char[(int)line2[i]]) {
+          fprintf(stderr, "invalid input\n");
+          fprintf(stderr, "offending sequence:\n%s\n", line2);
+          abort();
+        }
+      }
+      strncpy(seq1, line1, M-1);
+      strncpy(seq2, line2, M-1);
+    } else if (lineno % 4 == 0) {
+      if (readh) {
+        int scheck = snprintf(
+            info, 4 * M, "%s\n%s\n%s\n%s", header1, line1, header2, line2);
+        if (scheck < 0 || scheck > 4 * M - 1) {
+
+
+
+          alert();
+          krash();
+        }
+      } else {
+        // No need for the headers, the 'info' member is
+        // used to hold a string representation of the pair.
+        int scheck = snprintf(info, 2 * M, "%s/%s", seq1, seq2);
+        if (scheck < 0 || scheck > 2 * M - 1) {
+          alert();
+          krash();
+        }
+      }
+      int scheck = snprintf(seq, 2 * M + 8, "%s%s%s", seq1, sep, seq2);
+      if (scheck < 0 || scheck > 2 * M + 7) {
+        alert();
+        krash();
+      }
+      useq_t* new = new_useq(1, seq, info);
+      if (new == NULL) {
+        alert();
+        krash();
+      }
+
+      if (NEED_SEQIDS) {
+        new->nids = 1;
+        new->seqid = malloc(sizeof(int));
+        if (new->seqid == NULL) { alert(); krash(); }
+        new->seqid[0] = uSQ->nitems + 1;
+      } else {
+        new->nids = 0;
+        new->seqid = NULL;
+      }
+      push(new, &uSQ);
+    }
+  }
+
+  free(line1);
+  free(line2);
+  return uSQ;
+}
+
+gstack_t*
+read_file(FILE* inputf1, FILE* inputf2, const int verbose) {
+  if (inputf2 != NULL)
+    FORMAT = PE_FASTQ;
+  else {
+    // Read first line of the file to guess format.
+    // Store in global variable FORMAT.
+    char c = fgetc(inputf1);
+    switch (c) {
+      case EOF:
+        // Empty file.
+        return NULL;
+      case '>':
+        FORMAT = FASTA;
+        if (verbose)
+          fprintf(stderr, "FASTA format detected\n");
+        break;
+           case '@':
+        FORMAT = FASTQ;
+        if (verbose)
+          fprintf(stderr, "FASTQ format detected\n");
+        break;
+      default:
+        FORMAT = RAW;
+        if (verbose)
+          fprintf(stderr, "raw format detected\n");
+    }
+
+    if (ungetc(c, inputf1) == EOF) {
+      alert();
+      krash();
+    }
+  }
+
+  gstack_t* uSQ = new_gstack();
+  if (uSQ == NULL) {
+    alert();
+    krash();
+  }
+
+  if (FORMAT == RAW)
+    return read_rawseq(inputf1, uSQ);
+  if (FORMAT == FASTA)
+    return read_fasta(inputf1, uSQ);
+  if (FORMAT == FASTQ)
+    return read_fastq(inputf1, uSQ);
+  if (FORMAT == PE_FASTQ)
+    return read_PE_fastq(inputf1, inputf2, uSQ);
+
+  return NULL;
+}
+
+int
+pad_useq(gstack_t* useqS, int* median) {
+  // Compute maximum length.
+  int maxlen = 0;
+  for (size_t i = 0; i < useqS->nitems; i++) {
+    useq_t* u = useqS->items[i];
+    int len = strlen(u->seq);
+    if (len > maxlen)
+      maxlen = len;
+  }
+
+  // Alloc median bins. (Initializes to 0)
+  size_t* count = calloc(maxlen + 1, sizeof(size_t));
+  char* spaces = malloc(maxlen + 1);
+  if (spaces == NULL || count == NULL) {
+    alert();
+    krash();
+  }
+  for (int i = 0; i < maxlen; i++)
+    spaces[i] = ' ';
+  spaces[maxlen] = '\0';
+
+  // Pad all sequences with spaces.
+  for (size_t i = 0; i < useqS->nitems; i++) {
+    useq_t* u = useqS->items[i];
+    int len = strlen(u->seq);
+    count[len]++;
+    if (len == maxlen)
+      continue;
+    // Create a new sequence with padding characters.
+    char* padded = malloc(maxlen + 1);
+    if (padded == NULL) {
+      alert();
+      krash();
+    }
+    memcpy(padded, spaces, maxlen + 1);
+    memcpy(padded + maxlen - len, u->seq, len);
+    free(u->seq);
+    u->seq = padded;
+  }
+
+  // Compute median.
+  *median = 0;
+  size_t ccount = 0;
+  do {
+    ccount += count[++(*median)];
+  } while (ccount < useqS->nitems / 2);
+
+  // Free and return.
+  free(count);
+  free(spaces);
+  return maxlen;
+}
+
+void
+unpad_useq(gstack_t* useqS) {
+  // Take the length of the first sequence (assume all
+  // sequences have the same length).
+  int len = strlen(((useq_t*)useqS->items[0])->seq);
+  for (size_t i = 0; i < useqS->nitems; i++) {
+    useq_t* u = (useq_t*)useqS->items[i];
+    int pad = 0;
+    while (u->seq[pad] == ' ')
+      pad++;
+    // Create a new sequence without paddings characters.
+    char* unpadded = calloc((len - pad + 1), sizeof(char));
+    if (unpadded == NULL) {
+      alert();
+      krash();
+    }
+    memcpy(unpadded, u->seq + pad, len - pad + 1);
+    free(u->seq);
+    u->seq = unpadded;
+  }
+  return;
+}
+
+void
+transfer_useq_ids(useq_t* ud, useq_t* us)
+// Appends the sequence ID list from 'us' to 'ud',
+// the final list is unsorted.
+{
+  if (us->nids < 1)
+    return;
+  // Realloc destination buffer.
+  ud->seqid = realloc(ud->seqid, (ud->nids + us->nids) * sizeof(int));
+  if (ud->seqid == NULL) {
+    alert();
+    krash();
+  }
+  // Copy source list of ids to ud.
+  memcpy(ud->seqid + ud->nids, us->seqid, us->nids * sizeof(int));
+  // Update id counts in both sequences.
+  ud->nids += us->nids;
+  us->nids = 0;
+}
+
+void
+transfer_sorted_useq_ids(useq_t* ud, useq_t* us)
+// Appends the sequence ID list from 'us' to 'ud'
+// and sorts the final list.
+{
+  if (us->nids < 1)
+    return;
+  // Alloc merge-sort buffer.
+  int* buf = calloc(ud->nids + us->nids, sizeof(int));
+  if (buf == NULL) {
+    alert();
+    krash();
+  }
+  int *s, *d;
+  d = ud->seqid;
+  s = us->seqid;
+  // Merge algorithm (keeps them sorted and unique).
+  uint32_t i = 0, j = 0, k = 0;
+  while (i < ud->nids && j < us->nids) {
+    if (d[i] < s[j])
+      buf[k++] = d[i++];
+    else if (d[i] > s[j])
+      buf[k++] = s[j++];
+    else {
+      buf[k++] = d[i];
+      i++;
+      j++;
+    }
+  }
+  // TODO: use memcpy.
+  for (; i < ud->nids; i++)
+    buf[k++] = d[i];
+  for (; j < us->nids; j++)
+    buf[k++] = s[j];
+  // Update ID count.
+  free(ud->seqid);
+  ud->seqid = buf;
+  ud->nids = k;
+  us->nids = 0;
+}
+
+void
+transfer_counts_and_update_canonicals(useq_t* useq)
+{
+  // Ambiguous flag set, skip.
+  if (useq->sphere_d) {
+    return;
+  }
+
+  // If the read has no matches, it has no parent, so
+  // it is an ancestor and it must be canonical.
+  if (useq->matches == NULL) {
+    if (!useq->blacklisted)
+      useq->canonical = useq;
+    else
+      useq->canonical = NULL;
+    return;
+  }
+
+  // If the read has already been assigned a canonical, directly
+  // transfer counts and ids to the canonical and return.
+  if (useq->canonical != NULL) {
+    useq->canonical->count += useq->count;
+    // Counts transferred, remove from self.
+    useq->count = 0;
+    // Update canonical sphere size.
+    useq->canonical->sphere_c += 1;
+    return;
+  }
+
+  // The field 'matches' stores parents (useq with higher
+  // counts) stratified by distance to self.
+  // Consider that direct parents are the lowest nonempty
+  // match stratum. Others are disregarded (indirect).
+  gstack_t* matches;
+  for (int i = 0; (matches = useq->matches[i]) != TOWER_TOP; i++) {
+    if (matches->nitems > 0)
+      break;
+  }
+
+  // Continue propagation to direct parents. This will update
+  // the canonicals of the whole ancestry.
+  for (size_t i = 0; i < matches->nitems; i++) {
+    useq_t* match = (useq_t*)matches->items[i];
+    transfer_counts_and_update_canonicals(match);
+  }
+
+  // Self canonical is the canonical of the first parent...
+  useq_t* canonical = ((useq_t*)matches->items[0])->canonical;
+  if (canonical != NULL && canonical->blacklisted)
+    canonical = NULL;
+   // ... but if parents have different canonicals then
+   // self canonical is set to 'NULL'. (ambiguous)
+   for (size_t i = 1; i < matches->nitems; i++) {
+     useq_t* match = (useq_t*)matches->items[i];
+    if (match->canonical == NULL || match->canonical != canonical || (match->canonical && match->canonical->blacklisted)) {
+       canonical = NULL;
+       break;
+     }
+   }
+
+  // Set canonical and transfer counts and ids.
+  if (canonical) {
+    useq->canonical = canonical;
+
+    // Transfer counts and seq_ids to canonical.
+    canonical->count += useq->count;
+    useq->count = 0;
+    // Increase canonical sphere size.
+    canonical->sphere_c += 1;
+  }
+  // Otherwise, flag as ambiguous.
+  else {
+    useq->sphere_d = 1;
+  }
+
+  return;
+}
+
+void
+mp_resolve_ambiguous(useq_t* useq) {
+  // Ambiguous sequences must have NULL canonicals.
+  if (useq->canonical != NULL) {
+    return;
+  }
+
+  // If there are no parent matches, nothing to resolve.
+  if (useq->matches == NULL)
+    return;
+
+  // Get parents.
+  gstack_t* matches;
+  for (int i = 0; (matches = useq->matches[i]) != TOWER_TOP; i++) {
+    if (matches->nitems > 0)
+      break;
+  }
+
+  // Propagate if this is descendant of ambiguous.
+  for (size_t i = 0; i < matches->nitems; i++) {
+    useq_t* match = (useq_t*)matches->items[i];
+    if (match->canonical == NULL)
+      mp_resolve_ambiguous(match);
+  }
+
+  // Select canonical. Criteria:
+  // 1. The canonical parent with more counts.
+  // 2. The canonical parent whose sphere has more sequences.
+  // 3. The parent whose canonical has more counts.
+
+  // Criteria 1 and 2.
+  useq_t* canonical = NULL;
+  int cnt_max = 0;
+  int ssz_max = 0;
+  for (size_t i = 0; i < matches->nitems; i++) {
+    useq_t* match = (useq_t*)matches->items[i];
+    if (match->canonical == match && !match->blacklisted) {
+       if (match->count > cnt_max) {
+         canonical = match;
+         cnt_max = canonical->count;
+         ssz_max = canonical->sphere_c;
+       }
+       // Same count, compare sphere size.
+       else if (match->count == cnt_max && match != canonical) {
+         if (match->sphere_c > ssz_max) {
+           canonical = match;
+           ssz_max = canonical->sphere_c;
+         } else if (match->sphere_c == ssz_max)
+           canonical = NULL;
+       }
+    }
+  }
+
+  // Criterion 3.
+  if (canonical == NULL) {
+    cnt_max = 0;
+    for (size_t i = 0; i < matches->nitems; i++) {
+      useq_t* match_canon = ((useq_t*)matches->items[i])->canonical;
+      if (match_canon == NULL || match_canon->blacklisted) continue;
+      if (match_canon->count > cnt_max) {
+        cnt_max = match_canon->count;
+        canonical = match_canon;
+      }
+    }
+  }
+
+  // If no valid (non-blacklisted) canonical could be found, leave
+  // this sequence without a canonical instead of crashing.
+  if (canonical == NULL) {
+    return;
+  }
+
+  // Transfer counts and seq ids to canonical.
+  useq->canonical = canonical;
+
+  // Transfer counts and seq_ids to canonical.
+  canonical->count += useq->count;
+  useq->count = 0;
+  // Increase canonical sphere size.
+  canonical->sphere_c += 1;
+}
+
+int
+addmatch(useq_t* to, useq_t* from, int dist, int maxtau)
+// SYNOPSIS:
+//   Add a sequence to the match record of another.
+//
+// ARGUMENTS:
+//   to: pointer to the sequence to add the match to
+//   from: pointer to the sequence to add as a match
+//   dist: distance between the sequences
+//   maxtau: maximum allowed distance
+//
+// RETURN:
+//   0 upon success, 1 upon failure.
+//
+// SIDE EFFECT:
+//   Updates sequence pointed to by 'to' in place, potentially
+//   creating a match record,
+{
+  // Cannot add a match at a distance greater than 'maxtau'
+  // (this lead to a segmentation fault).
+  if (dist > maxtau)
+    return 1;
+  // Create stack if not done before.
+  if (to->matches == NULL)
+    to->matches = new_tower(maxtau + 1);
+  return push(from, to->matches + dist);
+}
+
+lookup_t*
+new_lookup(int slen, int maxlen, int tau) {
+  lookup_t* lut = (lookup_t*)malloc(
+      2 * sizeof(int) + sizeof(int*) + (tau + 1) * sizeof(char*));
+  if (lut == NULL) {
+    alert();
+    return NULL;
+  }
+
+  // Target size.
+  int k = slen / (tau + 1);
+  int rem = tau - slen % (tau + 1);
+
+  // Set parameters.
+  lut->slen = maxlen;
+  lut->kmers = tau + 1;
+  lut->klen = calloc(lut->kmers, sizeof(int));
+
+  // Compute k-mer lengths.
+  if (k > MAX_K_FOR_LOOKUP)
+    for (int i = 0; i < tau + 1; i++)
+      lut->klen[i] = MAX_K_FOR_LOOKUP;
+  else
+    for (int i = 0; i < tau + 1; i++)
+      lut->klen[i] = k - (rem-- > 0);
+
+  // Allocate lookup tables.
+  for (int i = 0; i < tau + 1; i++) {
+    size_t nmemb = 1 << max(0, (2 * lut->klen[i] - 3));
+    lut->lut[i] = calloc(nmemb, sizeof(unsigned char));
+    if (lut->lut[i] == NULL) {
+      while (--i >= 0) {
+        free(lut->lut[i]);
+      }
+      free(lut);
+      alert();
+      return NULL;
+    }
+  }
+
+  return lut;
+}
+
+void
+destroy_lookup(lookup_t* lut) {
+  for (int i = 0; i < lut->kmers; i++)
+    free(lut->lut[i]);
+  free(lut->klen);
+  free(lut);
+}
+
+int
+lut_search(lookup_t* lut, useq_t* query)
+// SYNOPSIS:
+//   Perform of a lookup search of the query and determine whether
+//   at least one of the k-mers extracted from the query was inserted
+//   in the lookup table. If this is not the case, the trie search can
+//   be skipped because the query cannot have a match for the given
+//   tau.
+//
+// ARGUMENTS:
+//   lut: the lookup table to search
+//   query: the query as a useq.
+//
+// RETURN:
+//   1 if any of the k-mers extracted from the query is in the
+//   lookup table, 0 if not, and -1 in case of failure.
+//
+// SIDE-EFFECTS:
+//   None.
+{
+  // Start from the end of the sequence. This will avoid potential
+  // misalignments on the first kmer due to insertions.
+  int offset = lut->slen;
+  // Iterate for all k-mers and for ins/dels.
+  for (int i = lut->kmers - 1; i >= 0; i--) {
+    offset -= lut->klen[i];
+    for (int j = -(lut->kmers - 1 - i); j <= lut->kmers - 1 - i; j++) {
+      // If sequence contains 'N' seq2id will return -1.
+      int seqid = seq2id(query->seq + offset + j, lut->klen[i]);
+      // Make sure to never proceed passed the end of string.
+      if (seqid == -2)
+        return -1;
+      if (seqid == -1)
+        continue;
+      // The lookup table proper is implemented as a bitmap.
+      if ((lut->lut[i][seqid / 8] >> (seqid % 8)) & 1)
+        return 1;
+    }
+  }
+
+  return 0;
+}
+
+int
+lut_insert(lookup_t* lut, useq_t* query) {
+  int seqlen = strlen(query->seq);
+
+  int offset = lut->slen;
+  for (int i = lut->kmers - 1; i >= 0; i--) {
+    offset -= lut->klen[i];
+    if (offset + lut->klen[i] > seqlen)
+      continue;
+    int seqid = seq2id(query->seq + offset, lut->klen[i]);
+    // The lookup table proper is implemented as a bitmap.
+    if (seqid >= 0)
+      lut->lut[i][seqid / 8] |= (1 << (seqid % 8));
+    // Make sure to never proceed passed the end of string.
+    else if (seqid == -2)
+      return 1;
+  }
+
+  // Insert successful.
+  return 0;
+}
+
+int
+seq2id(char* seq, int slen) {
+  int seqid = 0;
+  // Use the last 16 characters to construct the id.
+  int imin = slen > 16 ? slen - 16 : 0;
+  for (int i = imin; i < slen; i++) {
+    // Padding spaces are substituted by 'A'. It does not hurt
+    // anyway to generate some false positives.
+    if (seq[i] == 'A' || seq[i] == 'a' || seq[i] == ' ') {
+    } else if (seq[i] == 'C' || seq[i] == 'c')
+      seqid += 1;
+    else if (seq[i] == 'G' || seq[i] == 'g')
+      seqid += 2;
+    else if (seq[i] == 'T' || seq[i] == 't')
+      seqid += 3;
+    // Non DNA character (including end of string).
+    else
+      return seq[i] == '\0' ? -2 : -1;
+    if (i < slen - 1)
+      seqid <<= 2;
+  }
+
+  return seqid;
+}
+
+useq_t*
+new_useq(int count, char* seq, char* info) {
+  // Check input.
+  if (seq == NULL)
+    return NULL;
+
+  useq_t* new = calloc(1, sizeof(useq_t));
+  if (new == NULL) {
+    alert();
+    krash();
+  }
+  size_t slen = strlen(seq);
+  new->seq = malloc(slen + 1);
+  for (size_t i = 0; i < slen; i++)
+    new->seq[i] = capitalize[(uint8_t)seq[i]];
+  new->seq[slen] = 0;
+  new->count = count;
+  new->nids = 0;
+  new->sphere_c = 0;
+  new->sphere_d = 0;
+  new->seqid = NULL;
+  new->blacklisted = blacklist_contains(new->seq);
+  // NEW: pattern check moved to after reading; don't check here
+  new->visited = 0;
+  new->mean_quality = -1.0;
+  if (info != NULL) {
+    new->info = strdup(info);
+    if (new->info == NULL) {
+      alert();
+      krash();
+    }
+  }
+
+  return new;
+}
+
+void
+destroy_useq(useq_t* useq) {
+  if (useq->matches != NULL)
+    destroy_tower(useq->matches);
+  if (useq->info != NULL)
+    free(useq->info);
+  free(useq->seqid);
+  free(useq->seq);
+  free(useq);
+}
+
+int
+canonical_order(const void* a, const void* b) {
+  useq_t* u1 = *((useq_t**)a);
+  useq_t* u2 = *((useq_t**)b);
+  if (u1->canonical == u2->canonical)
+    return strcmp(u1->seq, u2->seq);
+  if (u1->canonical == NULL)
+    return 1;
+  if (u2->canonical == NULL)
+    return -1;
+  if (u1->canonical->count == u2->canonical->count) {
+    return strcmp(u1->canonical->seq, u2->canonical->seq);
+  }
+  if (u1->canonical->count > u2->canonical->count)
+    return -1;
+  return 1;
+}
+
+int
+sphere_size_order(const void* a, const void* b) {
+  useq_t* u1 = *((useq_t**)a);
+  useq_t* u2 = *((useq_t
