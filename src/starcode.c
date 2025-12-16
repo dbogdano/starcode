@@ -1452,6 +1452,38 @@ sphere_clustering(gstack_t* useqS) {
   return;
 }
 
+
+int_ascending(const void* a, const void* b) {
+  if (*(int*)a < *(int*)b)
+    return -1;
+  else
+    return 1;
+}
+
+idstack_t*
+idstack_new(size_t n_elm) {
+  idstack_t* stack = malloc(sizeof(idstack_t));
+  if (stack == NULL) {
+    alert();
+    krash();
+  }
+  stack->elm = calloc(n_elm, sizeof(int));
+  if (stack->elm == NULL) {
+    alert();
+    krash();
+  }
+  stack->pos = 0;
+  stack->max = n_elm;
+
+  return stack;
+}
+
+
+
+
+
+
+
 void
 message_passing_clustering(gstack_t* useqS) {
   // Transfer counts to parents recursively.
@@ -2583,4 +2615,73 @@ count_order(const void* a, const void* b) {
     return strcmp(u1->seq, u2->seq);
   else
     return u1->count < u2->count ? 1 : -1;
+}
+
+cluster_count(const void* a, const void* b) {
+  gstack_t* s1 = *((gstack_t**)a);
+  gstack_t* s2 = *((gstack_t**)b);
+  if (((useq_t*)s1->items[0])->count < ((useq_t*)s2->items[0])->count)
+    return 1;
+  else
+    return -1;
+}
+
+int
+int_ascending(const void* a, const void* b) {
+  if (*(int*)a < *(int*)b)
+    return -1;
+  else
+    return 1;
+}
+
+idstack_t*
+idstack_new(size_t n_elm) {
+  idstack_t* stack = malloc(sizeof(idstack_t));
+  if (stack == NULL) {
+    alert();
+    krash();
+  }
+  stack->elm = calloc(n_elm, sizeof(int));
+  if (stack->elm == NULL) {
+    alert();
+    krash();
+  }
+  stack->pos = 0;
+  stack->max = n_elm;
+
+  return stack;
+}
+
+void
+idstack_push(int* vals, size_t n_val, idstack_t* stack) {
+  size_t newsize = stack->max;
+  // Realloc buffer.
+  while (stack->pos + n_val > newsize)
+    newsize *= 2;
+  if (newsize > stack->max) {
+    stack->elm = realloc(stack->elm, newsize * sizeof(int));
+    if (stack->elm == NULL) {
+      alert();
+      krash();
+    }
+    stack->max = newsize;
+  }
+  // Copy values to stack.
+  memcpy(stack->elm + stack->pos, vals, n_val * sizeof(int));
+  // Update stack top position.
+  stack->pos += n_val;
+}
+
+void
+idstack_free(idstack_t* stack) {
+  free(stack->elm);
+  free(stack);
+}
+
+void
+krash(void) {
+  fprintf(stderr,
+      "starcode has crashed, please contact guillaume.filion@gmail.com "
+      "for support with this issue.\n");
+  abort();
 }
