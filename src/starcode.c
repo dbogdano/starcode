@@ -85,6 +85,7 @@ typedef struct match_t match_t;
 typedef struct mtplan_t mtplan_t;
 typedef struct mttrie_t mttrie_t;
 typedef struct mtjob_t mtjob_t;
+typedef struct cluster_job_t cluster_job_t;
 typedef struct lookup_t lookup_t;
 typedef struct propt_t propt_t;
 typedef struct idstack_t idstack_t;
@@ -163,6 +164,13 @@ struct mtjob_t {
   char* active;
 };
 
+struct cluster_job_t {
+  size_t start;
+  size_t end;
+  gstack_t* useqS;
+  pthread_mutex_t* mutex;
+};
+
 struct propt_t {
   char first[5];
   int pe_fastq;
@@ -215,7 +223,11 @@ gstack_t* seq2useq(gstack_t*, int);
 size_t seqsort(useq_t**, size_t, int);
 int size_order(const void* a, const void* b);
 void sphere_clustering(gstack_t*);
+void sphere_clustering_mt(gstack_t*, int);
+void* do_sphere_clustering(void*);
 void transfer_counts_and_update_canonicals(useq_t*);
+void message_passing_clustering_mt(gstack_t*, int);
+void* do_message_passing(void*);
 void transfer_sorted_useq_ids(useq_t*, useq_t*);
 void transfer_useq_ids(useq_t*, useq_t*);
 void unpad_useq(gstack_t*);
@@ -646,8 +658,8 @@ starcode(                // Public
     if (verbose)
       fprintf(stderr, "message passing clustering\n");
 
-    // Cluster the pairs.
-    message_passing_clustering(uSQ);
+    // Cluster the pairs (with multithreading support).
+    message_passing_clustering_mt(uSQ, thrmax);
     // Sort in canonical order.
     qsort(uSQ->items, uSQ->nitems, sizeof(useq_t*), canonical_order);
 
@@ -714,8 +726,8 @@ starcode(                // Public
   } else if (CLUSTERALG == SPHERES_CLUSTER) {
     if (verbose)
       fprintf(stderr, "spheres clustering\n");
-    // Cluster the pairs.
-    sphere_clustering(uSQ);
+    // Cluster the pairs (with multithreading support).
+    sphere_clustering_mt(uSQ, thrmax);
     // Sort in count order.
     qsort(uSQ->items, uSQ->nitems, sizeof(useq_t*), sphere_size_order);
 
@@ -1331,6 +1343,197 @@ compute_clusters(gstack_t* uSQ) {
       clusters->items, clusters->nitems, sizeof(gstack_t*), cluster_count);
 
   return clusters;
+}
+
+void*
+do_sphere_clustering(void* args) {
+  // Unpack arguments.
+  cluster_job_t* job = (cluster_job_t*)args;
+  gstack_t* useqS = job->useqS;
+  size_t start = job->start;
+  size_t end = job->end;
+  pthread_mutex_t* mutex = job->mutex;
+
+  // Process sequences in the assigned range.
+  // Each thread processes its own slice, using mutexes for shared updates.
+  for (size_t i = start; i < end; i++) {
+    useq_t* useq = (useq_t*)useqS->items[i];
+    
+    pthread_mutex_lock(mutex);
+    if (useq->canonical != NULL || useq->blacklisted) {
+      pthread_mutex_unlock(mutex);
+      continue;
+    }
+    useq->canonical = useq;
+    useq->sphere_c = useq->count;
+    useq->sphere_d = 0;
+    pthread_mutex_unlock(mutex);
+
+    if (useq->matches == NULL)
+      continue;
+
+    // Bidirectional edge references simplify the algorithm.
+    // Directly proceed to claim neighbor counts.
+    gstack_t* matches;
+    for (int j = 0; (matches = useq->matches[j]) != TOWER_TOP; j++) {
+      for (size_t k = 0; k < matches->nitems; k++) {
+        useq_t* match = (useq_t*)matches->items[k];
+        
+        pthread_mutex_lock(mutex);
+        
+        // If a sequence has been already claimed, remove it from list.
+        if (match->canonical != NULL) {
+          // Steal sequence from the other sphere if it is closer to this centroid.
+          if (j < match->sphere_d) {
+            // Update other sphere size.
+            match->canonical->sphere_c -= match->count;
+          } else {
+            matches->items[k--] = matches->items[--matches->nitems];
+            pthread_mutex_unlock(mutex);
+            continue;
+          }
+        }
+        
+        // Claim the sequence.
+        useq->sphere_c += match->count;
+        match->canonical = useq;
+        match->sphere_d = j;
+        
+        pthread_mutex_unlock(mutex);
+      }
+    }
+  }
+
+  return NULL;
+}
+
+void
+sphere_clustering_mt(gstack_t* useqS, int thrmax) {
+  // Sort in count order.
+  qsort(useqS->items, useqS->nitems, sizeof(useq_t*), count_order_spheres);
+
+  if (thrmax < 2) {
+    // Fall back to single-threaded version
+    sphere_clustering(useqS);
+    return;
+  }
+
+  // Initialize mutex for thread-safe updates.
+  pthread_mutex_t mutex;
+  pthread_mutex_init(&mutex, NULL);
+
+  // Create thread jobs.
+  size_t sequences_per_thread = (useqS->nitems + thrmax - 1) / thrmax;
+  pthread_t* threads = malloc(thrmax * sizeof(pthread_t));
+  cluster_job_t* jobs = malloc(thrmax * sizeof(cluster_job_t));
+
+  // Distribute work across threads.
+  int active_threads = 0;
+  for (int i = 0; i < thrmax; i++) {
+    size_t start = i * sequences_per_thread;
+    if (start >= useqS->nitems)
+      break;
+    
+    size_t end = (i + 1) * sequences_per_thread;
+    if (end > useqS->nitems)
+      end = useqS->nitems;
+
+    jobs[i].start = start;
+    jobs[i].end = end;
+    jobs[i].useqS = useqS;
+    jobs[i].mutex = &mutex;
+
+    if (pthread_create(&threads[i], NULL, do_sphere_clustering, &jobs[i])) {
+      alert();
+      krash();
+    }
+    active_threads++;
+  }
+
+  // Wait for all threads to finish.
+  for (int i = 0; i < active_threads; i++) {
+    pthread_join(threads[i], NULL);
+  }
+
+  // Cleanup.
+  pthread_mutex_destroy(&mutex);
+  free(threads);
+  free(jobs);
+
+  return;
+}
+
+void*
+do_message_passing(void* args) {
+  // Unpack arguments.
+  cluster_job_t* job = (cluster_job_t*)args;
+  gstack_t* useqS = job->useqS;
+  size_t start = job->start;
+  size_t end = job->end;
+
+  // Each thread processes its own slice independently.
+  // The transfer_counts_and_update_canonicals function is read-heavy on matches
+  // and mostly writes to the sequence's own canonical pointer.
+  for (size_t i = start; i < end; i++) {
+    useq_t* u = (useq_t*)useqS->items[i];
+    transfer_counts_and_update_canonicals(u);
+  }
+
+  return NULL;
+}
+
+void
+message_passing_clustering_mt(gstack_t* useqS, int thrmax) {
+  if (thrmax < 2) {
+    // Fall back to single-threaded version
+    message_passing_clustering(useqS);
+    return;
+  }
+
+  // Create thread jobs for count transfer phase.
+  size_t sequences_per_thread = (useqS->nitems + thrmax - 1) / thrmax;
+  pthread_t* threads = malloc(thrmax * sizeof(pthread_t));
+  cluster_job_t* jobs = malloc(thrmax * sizeof(cluster_job_t));
+
+  // Phase 1: Transfer counts to parents (can run in parallel).
+  int active_threads = 0;
+  for (int i = 0; i < thrmax; i++) {
+    size_t start = i * sequences_per_thread;
+    if (start >= useqS->nitems)
+      break;
+    
+    size_t end = (i + 1) * sequences_per_thread;
+    if (end > useqS->nitems)
+      end = useqS->nitems;
+
+    jobs[i].start = start;
+    jobs[i].end = end;
+    jobs[i].useqS = useqS;
+    jobs[i].mutex = NULL;
+
+    if (pthread_create(&threads[i], NULL, do_message_passing, &jobs[i])) {
+      alert();
+      krash();
+    }
+    active_threads++;
+  }
+
+  // Wait for all threads to finish phase 1.
+  for (int i = 0; i < active_threads; i++) {
+    pthread_join(threads[i], NULL);
+  }
+
+  // Phase 2: Resolve ambiguous assignments (single-threaded for now due to dependencies).
+  for (size_t i = 0; i < useqS->nitems; i++) {
+    useq_t* u = (useq_t*)useqS->items[i];
+    mp_resolve_ambiguous(u);
+  }
+
+  // Cleanup.
+  free(threads);
+  free(jobs);
+
+  return;
 }
 
 void
