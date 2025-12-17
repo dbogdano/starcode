@@ -135,6 +135,7 @@ struct mtplan_t {
   struct mttrie_t* tries;
   pthread_mutex_t* mutex;
   pthread_cond_t* monitor;
+  lookup_t* lut;
 };
 
 struct mttrie_t {
@@ -621,9 +622,9 @@ starcode(                // Public
   free(mtplan->monitor);
   for (int i = 0 ; i < mtplan->ntries ; i++) {
     free(mtplan->tries[i].jobs->node_pos);
-    free(mtplan->tries[i].jobs->lut);
     free(mtplan->tries[i].jobs);
   }
+  destroy_lookup(mtplan->lut);
   free(mtplan->tries);
   free(mtplan);
 
@@ -942,15 +943,12 @@ do_query(void* args) {
     useq_t* query = (useq_t*)useqS->items[i];
     int do_search = lut_search(lut, query) == 1;
 
-    // Insert the new sequence in the lut and trie, but let
+    // Insert the new sequence in the trie, but let
     // the last pointer to NULL so that the query does not
-    // find itself upon search.
+    // find itself upon search. The lookup table is shared and
+    // pre-populated, so we avoid mutating it here.
     void** data = NULL;
     if (job->build) {
-      if (lut_insert(lut, query)) {
-        alert();
-        krash();
-      }
       data = insert_string_wo_malloc(trie, query->seq, &node_pos);
       if (data == NULL || *data != NULL) {
         alert();
@@ -1119,6 +1117,19 @@ plan_mt(int tau, int height, int medianlen, int ntries, gstack_t* useqS)
     krash();
   }
 
+  // Build a shared lookup table once and reuse it across threads to save memory.
+  lookup_t* shared_lut = new_lookup(medianlen, height, tau);
+  if (shared_lut == NULL) {
+    alert();
+    krash();
+  }
+  for (int i = 0; i < useqS->nitems; i++) {
+    if (lut_insert(shared_lut, (useq_t*)useqS->items[i])) {
+      alert();
+      krash();
+    }
+  }
+
   // Initialize mutex.
   pthread_mutex_t* mutex = calloc(ntries + 1, sizeof(pthread_mutex_t));
   pthread_cond_t* monitor = malloc(sizeof(pthread_cond_t));
@@ -1163,15 +1174,6 @@ plan_mt(int tau, int height, int medianlen, int ntries, gstack_t* useqS)
       krash();
     }
 
-    // Allocate lookup struct.
-    // TODO: Try only one lut as well (it will always return 1
-    // in the query step though).
-    lookup_t* local_lut = new_lookup(medianlen, height, tau);
-    if (local_lut == NULL) {
-      alert();
-      krash();
-    }
-
     mttries[i].flag = TRIE_FREE;
     mttries[i].currentjob = 0;
     mttries[i].njobs = njobs;
@@ -1190,7 +1192,7 @@ plan_mt(int tau, int height, int medianlen, int ntries, gstack_t* useqS)
       jobs[j].useqS = useqS;
       jobs[j].trie = local_trie;
       jobs[j].node_pos = local_nodes;
-      jobs[j].lut = local_lut;
+      jobs[j].lut = shared_lut;
       jobs[j].mutex = mutex;
       jobs[j].monitor = monitor;
       jobs[j].jobsdone = &(mtplan->jobsdone);
@@ -1210,6 +1212,7 @@ plan_mt(int tau, int height, int medianlen, int ntries, gstack_t* useqS)
   mtplan->jobsdone = 0;
   mtplan->mutex = mutex;
   mtplan->monitor = monitor;
+  mtplan->lut = shared_lut;
   mtplan->tries = mttries;
 
   return mtplan;
