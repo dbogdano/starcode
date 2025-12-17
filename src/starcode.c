@@ -1135,7 +1135,7 @@ plan_mt(int tau, int height, int medianlen, int ntries, gstack_t* useqS)
     alert();
     krash();
   }
-  for (int i = 0; i < useqS->nitems; i++) {
+  for (size_t i = 0; i < useqS->nitems; i++) {
     if (lut_insert(shared_lut, (useq_t*)useqS->items[i])) {
       alert();
       krash();
