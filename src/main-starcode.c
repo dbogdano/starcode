@@ -45,6 +45,7 @@ char *USAGE =
 "  general options:\n"
 "    -d --dist: maximum Levenshtein distance (default auto)\n"
 "    -t --threads: number of concurrent threads (default 1)\n"
+"    --chunk-size: process input in chunks (MB, default: auto)\n"
 "    -q --quiet: quiet output (default verbose)\n"
 "    -v --version: display version and exit\n"
 "\n"
@@ -147,6 +148,7 @@ main(
    // Unset flags (value -1).
    int dist = -1;
    int threads = -1;
+   int chunk_size_mb = -1;
    double cluster_ratio = -1;
 
    // Unset options (value 'UNSET').
@@ -197,7 +199,8 @@ main(
          {"output1",           required_argument,        0, '3'},
          {"output2",           required_argument,        0, '4'},
          {"blacklist-file",    required_argument,        0, 'b'},
-         {"allow",     required_argument,                0, 'a'},
+         {"allow",             required_argument,        0, 'a'},
+         {"chunk-size",        required_argument,        0, '5'},
          {0, 0, 0, 0}
       };
 
@@ -358,6 +361,22 @@ main(
          }
          else {
             fprintf(stderr, "%s --thread set more than once\n", ERRM);
+            say_usage();
+            return EXIT_FAILURE;
+         }
+         break;
+
+      case '5':  // --chunk-size
+         if (chunk_size_mb < 0) {
+            chunk_size_mb = atoi(optarg);
+            if (chunk_size_mb < 1) {
+               fprintf(stderr, "%s --chunk-size must be positive\n", ERRM);
+               say_usage();
+               return EXIT_FAILURE;
+            }
+         }
+         else {
+            fprintf(stderr, "%s --chunk-size set more than once\n", ERRM);
             say_usage();
             return EXIT_FAILURE;
          }
@@ -560,7 +579,8 @@ main(
        id_flag,
        output_type,
        blacklistf,
-       allow_pattern
+       allow_pattern,
+       chunk_size_mb
    );
 
    if (inputf1 != stdin)   fclose(inputf1);

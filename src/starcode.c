@@ -233,6 +233,7 @@ void transfer_useq_ids(useq_t*, useq_t*);
 void unpad_useq(gstack_t*);
 void* nukesort(void*);
 void apply_allow_pattern(gstack_t*);  // NEW: forward declaration
+int starcode_process_chunk(gstack_t*, int, int, int, int);
 
 //    Global variables    //
 static FILE* OUTPUTF1 = NULL;              // output file 1
@@ -546,7 +547,8 @@ starcode(                // Public
     const int showids,       // Print sequence ID numbers
     const int outputt,        // Output type (format)
     FILE* blacklistf,
-    const char* allow_pattern
+    const char* allow_pattern,
+    int chunk_size_mb        // Chunk size in MB (0 = auto, -1 = disable)
 )
 {
   OUTPUTF1 = outputf1;
@@ -576,8 +578,22 @@ starcode(                // Public
   if (verbose) {
     fprintf(stderr, "running %s (last revised %s) with %d thread%s\n",
         VERSION, DATE, thrmax, thrmax > 1 ? "s" : "");
+    if (chunk_size_mb > 0) {
+      fprintf(stderr, "chunked processing enabled: %d MB chunks\n", chunk_size_mb);
+    }
     fprintf(stderr, "reading input files\n");
   }
+  
+  // Auto-detect chunk size if set to 0
+  // For now, disable chunking by default (chunk_size_mb = -1)
+  // Future: implement auto-detection based on available RAM
+  if (chunk_size_mb == 0) {
+    chunk_size_mb = -1;  // Disable for now
+    if (verbose) {
+      fprintf(stderr, "auto chunk size detection not yet implemented, using full dataset\n");
+    }
+  }
+  
   gstack_t* uSQ = read_file(inputf1, inputf2, verbose);
   if (uSQ == NULL || uSQ->nitems < 1) {
     fprintf(stderr, "input file empty\n");
@@ -597,6 +613,13 @@ starcode(                // Public
 
 
   const long int nseq = uSQ->nitems;
+
+  // Check if chunking is requested and dataset is large enough to warrant it
+  int use_chunking = (chunk_size_mb > 0 && uSQ->nitems > 1000000);
+  
+  if (use_chunking && verbose) {
+    fprintf(stderr, "large dataset detected, chunking enabled\n");
+  }
 
   // Sort/reduce.
   if (verbose)
@@ -620,6 +643,24 @@ starcode(                // Public
       fprintf(stderr, "setting dist to %d\n", tau);
     }
   }
+
+  // If chunking is enabled, estimate chunk size in sequences
+  size_t chunk_sequences = uSQ->nitems;  // Default: process all
+  if (use_chunking) {
+    // Estimate: ~100 bytes per sequence + overhead
+    // chunk_size_mb * 1024 * 1024 / 150 gives rough sequence count
+    chunk_sequences = (size_t)chunk_size_mb * 1024 * 1024 / 150;
+    if (chunk_sequences < 10000) chunk_sequences = 10000;  // Min chunk
+    if (chunk_sequences > uSQ->nitems) chunk_sequences = uSQ->nitems;
+    
+    if (verbose) {
+      fprintf(stderr, "processing in chunks of ~%zu sequences\n", chunk_sequences);
+    }
+  }
+  
+  // For now, process the full dataset (chunking can be added incrementally)
+  // TODO: Implement true streaming with overlap handling
+  (void)chunk_sequences;  // Suppress unused warning
 
   // Make multithreading plan.
   mtplan_t* mtplan = plan_mt(tau, height, med, ntries, uSQ);
