@@ -217,6 +217,10 @@ gstack_t* read_rawseq(FILE*, gstack_t*);
 gstack_t* read_fasta(FILE*, gstack_t*);
 gstack_t* read_fastq(FILE*, gstack_t*);
 gstack_t* read_file(FILE*, FILE*, int);
+gstack_t* read_fasta_chunk(FILE*, gstack_t*, size_t);
+gstack_t* read_fastq_chunk(FILE*, gstack_t*, size_t);
+gstack_t* read_PE_fastq_chunk(FILE*, FILE*, gstack_t*, size_t);
+gstack_t* read_file_chunk(FILE*, FILE*, int, size_t);
 gstack_t* read_PE_fastq(FILE*, FILE*, gstack_t*);
 int seq2id(char*, int);
 gstack_t* seq2useq(gstack_t*, int);
@@ -594,10 +598,96 @@ starcode(                // Public
     }
   }
   
-  gstack_t* uSQ = read_file(inputf1, inputf2, verbose);
-  if (uSQ == NULL || uSQ->nitems < 1) {
-    fprintf(stderr, "input file empty\n");
-    return 1;
+  gstack_t* uSQ = NULL;
+  int chunks_done = 0;
+  size_t chunk_sequences = 0; // computed later after format detection
+  int aggregate_for_full = 0;
+  gstack_t* global_acc = NULL;
+
+  if (chunk_size_mb > 0) {
+    aggregate_for_full = (OUTPUTT != NRED_OUTPUT);
+    if (aggregate_for_full) {
+      global_acc = new_gstack();
+      if (global_acc == NULL) { alert(); krash(); }
+    }
+
+    for (;;) {
+      if (chunk_sequences == 0) {
+        chunk_sequences = (size_t)chunk_size_mb * 1024 * 1024 / 150;
+        if (chunk_sequences < 10000) chunk_sequences = 10000;
+      }
+
+      uSQ = read_file_chunk(inputf1, inputf2, verbose, chunk_sequences);
+      if (uSQ == NULL || uSQ->nitems == 0) {
+        if (chunks_done == 0) { fprintf(stderr, "input file empty\n"); }
+        break;
+      }
+
+      apply_allow_pattern(uSQ);
+
+      const long int nseq = uSQ->nitems;
+      if (verbose) fprintf(stderr, "sorting (chunk #%d, %ld seqs)\n", chunks_done + 1, nseq);
+      uSQ->nitems = seqsort((useq_t**)uSQ->items, uSQ->nitems, thrmax);
+
+      size_t ntries = 3 * thrmax + (thrmax % 2 == 0);
+      if (uSQ->nitems < ntries) { ntries = 1; thrmax = 1; }
+      int med = -1;
+      int height = pad_useq(uSQ, &med);
+      if (tau < 0) { tau = med > 160 ? 8 : 2 + med / 30; if (verbose) fprintf(stderr, "setting dist to %d\n", tau); }
+      mtplan_t* mtplan = plan_mt(tau, height, med, ntries, uSQ);
+      run_plan(mtplan, verbose, thrmax);
+      if (verbose) fprintf(stderr, "progress: 100.00%% (chunk #%d)\n", chunks_done + 1);
+
+      free(mtplan->mutex);
+      free(mtplan->monitor);
+      for (int i = 0 ; i < mtplan->ntries ; i++) {
+        free(mtplan->tries[i].jobs->node_pos);
+        free(mtplan->tries[i].jobs);
+      }
+      destroy_lookup(mtplan->lut);
+      free(mtplan->tries);
+      free(mtplan);
+
+      unpad_useq(uSQ);
+
+      if (OUTPUTT == NRED_OUTPUT) {
+        for (size_t i = 0; i < uSQ->nitems; i++) {
+          useq_t* u = (useq_t*)uSQ->items[i];
+          if (u == NULL) continue;
+          fprintf(OUTPUTF1, "%s\n", u->seq);
+        }
+        for (size_t i = 0; i < uSQ->nitems; i++) {
+          useq_t* u = (useq_t*)uSQ->items[i];
+          if (u == NULL) continue;
+          if (u->seqid) free(u->seqid);
+          free(u);
+        }
+        free(uSQ->items);
+        free(uSQ);
+      } else {
+        // Aggregate deduped chunk into global accumulator for full pipeline later.
+        for (size_t i = 0; i < uSQ->nitems; i++) {
+          push(uSQ->items[i], &global_acc);
+        }
+        free(uSQ->items);
+        free(uSQ);
+      }
+
+      chunks_done++;
+    }
+
+    if (OUTPUTT == NRED_OUTPUT) {
+      return 0;
+    }
+
+    // Use aggregated unique sequences as input for full pipeline.
+    uSQ = global_acc;
+  } else {
+    uSQ = read_file(inputf1, inputf2, verbose);
+    if (uSQ == NULL || uSQ->nitems < 1) {
+      fprintf(stderr, "input file empty\n");
+      return 1;
+    }
   }
 
   /* Apply allow-pattern AFTER reading but BEFORE padding/sorting. */
@@ -643,24 +733,6 @@ starcode(                // Public
       fprintf(stderr, "setting dist to %d\n", tau);
     }
   }
-
-  // If chunking is enabled, estimate chunk size in sequences
-  size_t chunk_sequences = uSQ->nitems;  // Default: process all
-  if (use_chunking) {
-    // Estimate: ~100 bytes per sequence + overhead
-    // chunk_size_mb * 1024 * 1024 / 150 gives rough sequence count
-    chunk_sequences = (size_t)chunk_size_mb * 1024 * 1024 / 150;
-    if (chunk_sequences < 10000) chunk_sequences = 10000;  // Min chunk
-    if (chunk_sequences > uSQ->nitems) chunk_sequences = uSQ->nitems;
-    
-    if (verbose) {
-      fprintf(stderr, "processing in chunks of ~%zu sequences\n", chunk_sequences);
-    }
-  }
-  
-  // For now, process the full dataset (chunking can be added incrementally)
-  // TODO: Implement true streaming with overlap handling
-  (void)chunk_sequences;  // Suppress unused warning
 
   // Make multithreading plan.
   mtplan_t* mtplan = plan_mt(tau, height, med, ntries, uSQ);
@@ -1942,6 +2014,48 @@ read_fasta(FILE* inputf, gstack_t* uSQ) {
   return uSQ;
 }
 
+gstack_t*
+read_fasta_chunk(FILE* inputf, gstack_t* uSQ, size_t max_items) {
+  ssize_t nread;
+  size_t nchar = M;
+  char* line = malloc(M);
+  if (line == NULL) { alert(); krash(); }
+
+  char* header = NULL;
+  size_t lineno = 0;
+
+  int const readh = OUTPUTT == NRED_OUTPUT;
+  while ((nread = getline(&line, &nchar, inputf)) != -1) {
+    if (uSQ->nitems >= max_items) break;
+    lineno++;
+    if (line[nread - 1] == '\n') line[nread - 1] = '\0';
+
+    if (lineno % 2 == 0) {
+      size_t seqlen = strlen(line);
+      if (seqlen > MAXBRCDLEN) { fprintf(stderr, "max sequence length exceeded (%d)\n", MAXBRCDLEN); fprintf(stderr, "offending sequence:\n%s\n", line); abort(); }
+      for (size_t i = 0; i < seqlen; i++) {
+        if (!valid_DNA_char[(int)line[i]]) { fprintf(stderr, "invalid input\n"); fprintf(stderr, "offending sequence:\n%s\n", line); abort(); }
+      }
+      useq_t* new = new_useq(1, line, header);
+      if (new == NULL) { alert(); krash(); }
+      if (header != NULL) { free(header); header = NULL; }
+      if (NEED_SEQIDS) {
+        new->nids = 1; new->seqid = malloc(sizeof(int));
+        if (new->seqid == NULL) { alert(); krash(); }
+        new->seqid[0] = uSQ->nitems + 1;
+      } else { new->nids = 0; new->seqid = NULL; }
+      push(new, &uSQ);
+    } else if (readh) {
+      header = strdup(line);
+      if (header == NULL) { alert(); krash(); }
+    }
+  }
+
+  if (header != NULL) free(header);
+  free(line);
+  return uSQ;
+}
+
 // Step 4: Modify read_fastq to capture and set quality
 gstack_t*
 read_fastq(FILE* inputf, gstack_t* uSQ) {
@@ -2013,6 +2127,58 @@ read_fastq(FILE* inputf, gstack_t* uSQ) {
         new->nids = 0;
         new->seqid = NULL;
       }
+      push(new, &uSQ);
+    }
+  }
+
+  free(line);
+  return uSQ;
+}
+
+gstack_t*
+read_fastq_chunk(FILE* inputf, gstack_t* uSQ, size_t max_items) {
+  ssize_t nread;
+  size_t nchar = M;
+  char* line = malloc(M);
+  if (line == NULL) { alert(); krash(); }
+
+  char seq[M + 1] = {0};
+  char header[M + 1] = {0};
+  char quality[M + 1] = {0};
+  char info[2 * M + 2] = {0};
+  size_t lineno = 0;
+
+  int const readh = OUTPUTT == NRED_OUTPUT;
+  while ((nread = getline(&line, &nchar, inputf)) != -1) {
+    if (uSQ->nitems >= max_items) break;
+    lineno++;
+    if (line[nread - 1] == '\n') line[nread - 1] = '\0';
+
+    if (readh && lineno % 4 == 1) {
+      strncpy(header, line, M);
+    } else if (lineno % 4 == 2) {
+      size_t seqlen = strlen(line);
+      if (seqlen > MAXBRCDLEN) { fprintf(stderr, "max sequence length exceeded (%d)\n", MAXBRCDLEN); fprintf(stderr, "offending sequence:\n%s\n", line); abort(); }
+      for (size_t i = 0; i < seqlen; i++) {
+        if (!valid_DNA_char[(int)line[i]]) { fprintf(stderr, "invalid input\n"); fprintf(stderr, "offending sequence:\n%s\n", line); abort(); }
+      }
+      strncpy(seq, line, M);
+    } else if (lineno % 4 == 3) {
+      continue;
+    } else if (lineno % 4 == 0) {
+      strncpy(quality, line, M);
+      if (readh) {
+        int status = snprintf(info, 2 * M + 2, "%s\n%s", header, quality);
+        if (status < 0 || status > 2 * M - 1) { alert(); krash(); }
+      }
+      useq_t* new = new_useq(1, seq, info);
+      if (new == NULL) { alert(); krash(); }
+      new->mean_quality = compute_mean_quality(quality);
+      if (NEED_SEQIDS) {
+        new->nids = 1; new->seqid = malloc(sizeof(int));
+        if (new->seqid == NULL) { alert(); krash(); }
+        new->seqid[0] = uSQ->nitems + 1;
+      } else { new->nids = 0; new->seqid = NULL; }
       push(new, &uSQ);
     }
   }
@@ -2150,6 +2316,79 @@ read_PE_fastq(FILE* inputf1, FILE* inputf2, gstack_t* uSQ) {
 }
 
 gstack_t*
+read_PE_fastq_chunk(FILE* inputf1, FILE* inputf2, gstack_t* uSQ, size_t max_items) {
+  char c1 = fgetc(inputf1);
+  char c2 = fgetc(inputf2);
+  if (c1 != '@' || c2 != '@') { fprintf(stderr, "input not a pair of fastq files\n"); abort(); }
+  if (ungetc(c1, inputf1) == EOF || ungetc(c2, inputf2) == EOF) { alert(); krash(); }
+
+  ssize_t nread;
+  size_t nchar = M;
+  char* line1 = malloc(M);
+  char* line2 = malloc(M);
+  if (line1 == NULL && line2 == NULL) { alert(); krash(); }
+
+  char seq1[M] = {0};
+  char seq2[M] = {0};
+  char seq[2 * M + 8] = {0};
+  char header1[M] = {0};
+  char header2[M] = {0};
+  char info[4 * M] = {0};
+  int lineno = 0;
+
+  int const readh = OUTPUTT == NRED_OUTPUT;
+  char sep[STARCODE_MAX_TAU + 2] = {0};
+  memset(sep, '-', STARCODE_MAX_TAU + 1);
+
+  while ((nread = getline(&line1, &nchar, inputf1)) != -1) {
+    if (uSQ->nitems >= max_items) break;
+    lineno++;
+    if (line1[nread - 1] == '\n') line1[nread - 1] = '\0';
+    if ((nread = getline(&line2, &nchar, inputf2)) == -1) { fprintf(stderr, "non conformable paired-end fastq files\n"); abort(); }
+    if (line2[nread - 1] == '\n') line2[nread - 1] = '\0';
+
+    if (readh && lineno % 4 == 1) {
+      strncpy(header1, line1, M-1);
+      strncpy(header2, line2, M-1);
+    } else if (lineno % 4 == 2) {
+      size_t seqlen1 = strlen(line1);
+      size_t seqlen2 = strlen(line2);
+      if (seqlen1 > MAXBRCDLEN || seqlen2 > MAXBRCDLEN) {
+        fprintf(stderr, "max sequence length exceeded (%d)\n", MAXBRCDLEN);
+        fprintf(stderr, "offending sequences:\n%s\n%s\n", line1, line2);
+        abort();
+      }
+      for (size_t i = 0; i < seqlen1; i++) if (!valid_DNA_char[(int)line1[i]]) { fprintf(stderr, "invalid input\n"); fprintf(stderr, "offending sequence:\n%s\n", line1); abort(); }
+      for (size_t i = 0; i < seqlen2; i++) if (!valid_DNA_char[(int)line2[i]]) { fprintf(stderr, "invalid input\n"); fprintf(stderr, "offending sequence:\n%s\n", line2); abort(); }
+      strncpy(seq1, line1, M-1);
+      strncpy(seq2, line2, M-1);
+    } else if (lineno % 4 == 0) {
+      if (readh) {
+        int scheck = snprintf(info, 4 * M, "%s\n%s\n%s\n%s", header1, line1, header2, line2);
+        if (scheck < 0 || scheck > 4 * M - 1) { alert(); krash(); }
+      } else {
+        int scheck = snprintf(info, 2 * M, "%s/%s", seq1, seq2);
+        if (scheck < 0 || scheck > 2 * M - 1) { alert(); krash(); }
+      }
+      int scheck = snprintf(seq, 2 * M + 8, "%s%s%s", seq1, sep, seq2);
+      if (scheck < 0 || scheck > 2 * M + 7) { alert(); krash(); }
+      useq_t* new = new_useq(1, seq, info);
+      if (new == NULL) { alert(); krash(); }
+      if (NEED_SEQIDS) {
+        new->nids = 1; new->seqid = malloc(sizeof(int));
+        if (new->seqid == NULL) { alert(); krash(); }
+        new->seqid[0] = uSQ->nitems + 1;
+      } else { new->nids = 0; new->seqid = NULL; }
+      push(new, &uSQ);
+    }
+  }
+
+  free(line1);
+  free(line2);
+  return uSQ;
+}
+
+gstack_t*
 read_file(FILE* inputf1, FILE* inputf2, const int verbose) {
   if (inputf2 != NULL)
     FORMAT = PE_FASTQ;
@@ -2197,6 +2436,36 @@ read_file(FILE* inputf1, FILE* inputf2, const int verbose) {
     return read_fastq(inputf1, uSQ);
   if (FORMAT == PE_FASTQ)
     return read_PE_fastq(inputf1, inputf2, uSQ);
+
+  return NULL;
+}
+
+gstack_t*
+read_file_chunk(FILE* inputf1, FILE* inputf2, const int verbose, size_t max_items) {
+  if (inputf2 != NULL)
+    FORMAT = PE_FASTQ;
+  else {
+    char c = fgetc(inputf1);
+    switch (c) {
+      case EOF: return NULL;
+      case '>': FORMAT = FASTA; if (verbose) fprintf(stderr, "FASTA format detected\n"); break;
+      case '@': FORMAT = FASTQ; if (verbose) fprintf(stderr, "FASTQ format detected\n"); break;
+      default:  FORMAT = RAW;   if (verbose) fprintf(stderr, "raw format detected\n");
+    }
+    if (ungetc(c, inputf1) == EOF) { alert(); krash(); }
+  }
+
+  gstack_t* uSQ = new_gstack();
+  if (uSQ == NULL) { alert(); krash(); }
+
+  if (FORMAT == RAW)
+    return read_rawseq(inputf1, uSQ);
+  if (FORMAT == FASTA)
+    return read_fasta_chunk(inputf1, uSQ, max_items);
+  if (FORMAT == FASTQ)
+    return read_fastq_chunk(inputf1, uSQ, max_items);
+  if (FORMAT == PE_FASTQ)
+    return read_PE_fastq_chunk(inputf1, inputf2, uSQ, max_items);
 
   return NULL;
 }
