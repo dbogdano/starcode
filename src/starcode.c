@@ -536,6 +536,20 @@ compute_mean_quality(const char* qual_str) {
   return count > 0 ? sum / count : -1.0;
 }
 
+static void
+reset_useq_cluster_state(useq_t* u) {
+  if (u == NULL)
+    return;
+  if (u->matches != NULL) {
+    destroy_tower(u->matches);
+    u->matches = NULL;
+  }
+  u->canonical = NULL;
+  u->sphere_c = 0;
+  u->sphere_d = 0;
+  u->visited = 0;
+}
+
 int 
 starcode(                // Public
     FILE* inputf1,           // First input file
@@ -667,7 +681,9 @@ starcode(                // Public
       } else {
         // Aggregate deduped chunk into global accumulator for full pipeline later.
         for (size_t i = 0; i < uSQ->nitems; i++) {
-          push(uSQ->items[i], &global_acc);
+          useq_t* u = (useq_t*)uSQ->items[i];
+          reset_useq_cluster_state(u);
+          push(u, &global_acc);
         }
         free(uSQ->items);
         free(uSQ);
