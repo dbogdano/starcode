@@ -58,7 +58,8 @@ int starcode(
    const int showids,
    const int outputt,
    FILE *blacklistf,
-      const char *allow_pattern
+      const char *allow_pattern,
+      int counts_input
 );
 
 #endif

@@ -77,6 +77,7 @@ typedef enum {
   FASTQ,
   RAW,
   PE_FASTQ,
+  COUNTS_TSV,
   UNSET,
 } format_t;
 
@@ -208,6 +209,7 @@ gstack_t* read_rawseq(FILE*, gstack_t*);
 gstack_t* read_fasta(FILE*, gstack_t*);
 gstack_t* read_fastq(FILE*, gstack_t*);
 gstack_t* read_file(FILE*, FILE*, int);
+gstack_t* read_counts_tsv(FILE*, gstack_t*);
 gstack_t* read_PE_fastq(FILE*, FILE*, gstack_t*);
 int seq2id(char*, int);
 gstack_t* seq2useq(gstack_t*, int);
@@ -533,7 +535,8 @@ starcode(                // Public
     const int showids,       // Print sequence ID numbers
     const int outputt,        // Output type (format)
     FILE* blacklistf,
-    const char* allow_pattern
+  const char* allow_pattern,
+  int counts_input
 )
 {
   OUTPUTF1 = outputf1;
@@ -563,9 +566,15 @@ starcode(                // Public
   if (verbose) {
     fprintf(stderr, "running %s (last revised %s) with %d thread%s\n",
         VERSION, DATE, thrmax, thrmax > 1 ? "s" : "");
-    fprintf(stderr, "reading input files\n");
+    fprintf(stderr, "reading input files%s\n", counts_input ? " (counts TSV)" : "");
   }
-  gstack_t* uSQ = read_file(inputf1, inputf2, verbose);
+  gstack_t* uSQ = NULL;
+  if (counts_input) {
+    FORMAT = RAW;
+    uSQ = read_counts_tsv(inputf1, new_gstack());
+  } else {
+    uSQ = read_file(inputf1, inputf2, verbose);
+  }
   if (uSQ == NULL || uSQ->nitems < 1) {
     fprintf(stderr, "input file empty\n");
     return 1;
@@ -859,6 +868,50 @@ starcode(                // Public
 
   return 0;
 
+}
+gstack_t*
+read_counts_tsv(FILE* inputf, gstack_t* uSQ) {
+  ssize_t nread;
+  size_t nchar = M;
+  char* line = malloc(M);
+  if (line == NULL) { alert(); krash(); }
+
+  while ((nread = getline(&line, &nchar, inputf)) != -1) {
+    if (nread > 0 && line[nread - 1] == '\n') line[nread - 1] = '\0';
+    // Skip empty lines
+    if (line[0] == '\0') continue;
+    // Find first tab or space separator
+    char* p = line;
+    while (*p && *p != '\t' && *p != ' ') p++;
+    if (!*p) { fprintf(stderr, "invalid counts TSV line (no separator): %s\n", line);
+               abort(); }
+    *p++ = '\0';
+    // Parse count (skip extra spaces/tabs)
+    while (*p == ' ' || *p == '\t') p++;
+    long c = strtol(p, NULL, 10);
+    if (c <= 0) { fprintf(stderr, "invalid count in TSV: %s\n", p); abort(); }
+    // Validate sequence characters
+    size_t seqlen = strlen(line);
+    if (seqlen > MAXBRCDLEN) {
+      fprintf(stderr, "max sequence length exceeded (%d)\n", MAXBRCDLEN);
+      fprintf(stderr, "offending sequence:\n%s\n", line);
+      abort();
+    }
+    for (size_t i = 0; i < seqlen; i++) {
+      if (!valid_DNA_char[(int)line[i]]) {
+        fprintf(stderr, "invalid input\n");
+        fprintf(stderr, "offending sequence:\n%s\n", line);
+        abort();
+      }
+    }
+    useq_t* u = new_useq((int)c, line, NULL);
+    if (u == NULL) { alert(); krash(); }
+    // In counts mode, do not allocate seqIDs
+    u->nids = 0; u->seqid = NULL;
+    push(u, &uSQ);
+  }
+  free(line);
+  return uSQ;
 }
 
 void

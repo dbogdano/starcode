@@ -74,7 +74,10 @@ char *USAGE =
 "       --non-redundant: remove redundant sequences from input file(s)\n"
 "       --print-clusters: outputs cluster compositions\n"
 "       --seq-id: print sequence id numbers (1-based)\n"
-"       --tidy: print each sequence and its centroid\n";
+"       --tidy: print each sequence and its centroid\n"
+"\n"
+"  special input modes\n"
+"       --counts-input: input is TSV 'SEQ\\tCOUNT' of unique sequences\n";
 
 
 
@@ -143,6 +146,7 @@ main(
    static int cl_flag = 0;
    static int id_flag = 0;
    static int cp_flag = 0;
+   static int ci_flag = 0;  // counts-input mode
 
    // Unset flags (value -1).
    int dist = -1;
@@ -198,6 +202,7 @@ main(
          {"output2",           required_argument,        0, '4'},
          {"blacklist-file",    required_argument,        0, 'b'},
          {"allow",     required_argument,                0, 'a'},
+         {"counts-input",     no_argument,                &ci_flag, 1},
          {0, 0, 0, 0}
       };
 
@@ -408,6 +413,16 @@ main(
    }
 
    // Check options compatibility. //
+   if (ci_flag && (input1 != UNSET || input2 != UNSET)) {
+      fprintf(stderr, "%s --counts-input supports single input only (no paired-end)\n", ERRM);
+      say_usage();
+      return EXIT_FAILURE;
+   }
+   if (ci_flag && (nr_flag || td_flag)) {
+      fprintf(stderr, "%s --counts-input is incompatible with --non-redundant and --tidy outputs\n", ERRM);
+      say_usage();
+      return EXIT_FAILURE;
+   }
    if (nr_flag && (cl_flag || id_flag)) {
       fprintf(stderr,
             "%s --non-redundant flag is incompatible with "
@@ -560,7 +575,8 @@ main(
        id_flag,
        output_type,
        blacklistf,
-       allow_pattern
+         allow_pattern,
+         ci_flag
    );
 
    if (inputf1 != stdin)   fclose(inputf1);
