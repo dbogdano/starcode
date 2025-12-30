@@ -355,7 +355,7 @@ void print_tidy( // Private
 //   print slash-separated pairs next to their slash-
 //   separated pair of centroids.
 {
-  useq_t** outputseq = calloc(sizeof(useq_t*), nseq);
+  useq_t** outputseq = calloc(nseq, sizeof(useq_t*));
   if (outputseq == NULL) {
     alert();
     krash();
