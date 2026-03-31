@@ -40,7 +40,7 @@ Output:
     reads\talgo\tdist\tratio\tclusters\tmax_rss\treal_s\toutput_file
 
 Algorithms swept:
-  mp, sphere, cc, cc_stream
+  mp, sphere, cc
 EOF
 }
 
@@ -92,21 +92,6 @@ if [[ ! -x "$STARCODE_BIN" \
    || "$ROOT_DIR/src/starcode.h" -nt "$STARCODE_BIN" ]]; then
   echo "Building starcode..."
   (cd "$ROOT_DIR" && make -s)
-fi
-
-# Detect optional support for --stream-clusters.
-HAS_STREAM_CLUSTERS=0
-if "$STARCODE_BIN" --help 2>&1 | grep -q -- "--stream-clusters"; then
-  HAS_STREAM_CLUSTERS=1
-else
-  # If using repo-local binary, rebuild once and re-check.
-  if [[ "$STARCODE_BIN" == "$ROOT_DIR/starcode" ]]; then
-    echo "Binary does not support --stream-clusters. Rebuilding..."
-    (cd "$ROOT_DIR" && make -s)
-    if "$STARCODE_BIN" --help 2>&1 | grep -q -- "--stream-clusters"; then
-      HAS_STREAM_CLUSTERS=1
-    fi
-  fi
 fi
 
 if [[ -z "$OUTDIR" ]]; then
@@ -283,18 +268,8 @@ for READS_CURRENT in $READ_SIZES; do
     done
     run_case sphere "$d" NA --sphere
     run_case cc "$d" NA --connected-comp
-    if [[ "$HAS_STREAM_CLUSTERS" -eq 1 ]]; then
-      run_case cc_stream "$d" NA --connected-comp --stream-clusters
-    else
-      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-        "$READS_CURRENT" "cc_stream" "$d" "NA" "SKIPPED" "NA" "NA" "unsupported_by_binary" >> "$SUMMARY"
-    fi
   done
 done
-
-if [[ "$HAS_STREAM_CLUSTERS" -eq 0 ]]; then
-  echo "Warning: STARCODE_BIN does not support --stream-clusters; cc_stream rows were skipped." >&2
-fi
 
 log "Done. Summary: $SUMMARY"
 log "Tip: sort by clusters/time to find stable fast settings."
