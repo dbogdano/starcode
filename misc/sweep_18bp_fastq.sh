@@ -82,8 +82,18 @@ if [[ ! -f "$INPUT" ]]; then
   exit 2
 fi
 
-if [[ ! -x "$STARCODE_BIN" ]]; then
-  echo "starcode binary not found at $STARCODE_BIN; attempting build..."
+# Build when missing or stale (common during option development).
+if [[ ! -x "$STARCODE_BIN" \
+   || "$ROOT_DIR/src/main-starcode.c" -nt "$STARCODE_BIN" \
+   || "$ROOT_DIR/src/starcode.c" -nt "$STARCODE_BIN" \
+   || "$ROOT_DIR/src/starcode.h" -nt "$STARCODE_BIN" ]]; then
+  echo "Building starcode..."
+  (cd "$ROOT_DIR" && make -s)
+fi
+
+# Ensure expected options exist in the binary.
+if ! "$STARCODE_BIN" --help 2>&1 | grep -q -- "--stream-clusters"; then
+  echo "Binary does not support --stream-clusters. Rebuilding..."
   (cd "$ROOT_DIR" && make -s)
 fi
 
@@ -124,10 +134,17 @@ printf "algo\tdist\tratio\tclusters\tmax_rss\treal_s\toutput_file\n" > "$SUMMARY
 
 log "Preparing subsample ($READS reads) ..."
 if [[ "$INPUT" == *.gz ]]; then
-  # Use process substitution to avoid SIGPIPE/141 when awk exits early
-  # after collecting max reads from a compressed stream.
-  awk -v max="$READS" '{ print; if (NR % 4 == 0) {r++; if (r >= max) exit} }' \
-    < <(gzip -dc "$INPUT") > "$SUB_FASTQ"
+  # Avoid false failures from SIGPIPE (141) when reader exits early.
+  set +e
+  set +o pipefail
+  gzip -dc "$INPUT" | awk -v max="$READS" '{ print; if (NR % 4 == 0) {r++; if (r >= max) exit} }' > "$SUB_FASTQ"
+  subsample_rc=$?
+  set -o pipefail
+  set -e
+  if [[ "$subsample_rc" -ne 0 ]]; then
+    echo "Subsample extraction failed for gz input (exit $subsample_rc)." >> "$ERR_LOG"
+    exit "$subsample_rc"
+  fi
 else
   awk -v max="$READS" '{ print; if (NR % 4 == 0) {r++; if (r >= max) exit} }' "$INPUT" > "$SUB_FASTQ"
 fi
@@ -197,8 +214,26 @@ run_case() {
 
   cmd+=("$@")
 
-  # shellcheck disable=SC2086
-  "$TIME_CMD" $TIME_ARGS "${cmd[@]}" 2> "$log_file"
+  local time_cmd=("$TIME_CMD")
+  if [[ -n "$TIME_ARGS" ]]; then
+    time_cmd+=("$TIME_ARGS")
+  fi
+
+  set +e
+  "${time_cmd[@]}" "${cmd[@]}" 2> "$log_file"
+  local rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    local cmd_str
+    printf -v cmd_str '%q ' "${cmd[@]}"
+    {
+      echo "Run failed: algo=$algo dist=$dist ratio=$ratio exit=$rc"
+      echo "command: $cmd_str"
+      echo "time/stderr tail:"
+      tail -n 40 "$log_file" || true
+    } >> "$ERR_LOG"
+    return "$rc"
+  fi
 
   local clusters
   clusters=$(wc -l < "$out_file" | tr -d ' ')
