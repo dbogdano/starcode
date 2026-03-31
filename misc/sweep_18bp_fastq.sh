@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 # Parameter sweep for barcode clustering on FASTQ input.
 # - Subsamples first N reads from FASTQ/FASTQ.GZ
@@ -9,6 +9,10 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 STARCODE_BIN="${STARCODE_BIN:-$ROOT_DIR/starcode}"
+
+log() {
+  printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"
+}
 
 usage() {
   cat <<'EOF'
@@ -88,6 +92,22 @@ if [[ -z "$OUTDIR" ]]; then
 fi
 mkdir -p "$OUTDIR"
 
+RUN_LOG="$OUTDIR/run.log"
+ERR_LOG="$OUTDIR/error.log"
+
+on_error() {
+  local line="$1"
+  local code="$2"
+  {
+    echo "ERROR: sweep failed"
+    echo "line: $line"
+    echo "exit_code: $code"
+    echo "last_command: ${BASH_COMMAND:-unknown}"
+  } >> "$ERR_LOG"
+  echo "Sweep failed. See: $ERR_LOG" >&2
+}
+trap 'on_error ${LINENO} $?' ERR
+
 TMPDIR_SWEEP="$(mktemp -d "${TMPDIR:-/tmp}/starcode_sweep.XXXXXX")"
 if [[ "$KEEP_TEMP" -eq 1 ]]; then
   echo "Keeping temp dir: $TMPDIR_SWEEP"
@@ -99,18 +119,31 @@ SUB_FASTQ="$TMPDIR_SWEEP/subsample.fastq"
 COUNTS_TSV="$TMPDIR_SWEEP/subsample.counts.tsv"
 SUMMARY="$OUTDIR/summary.tsv"
 
-echo "Preparing subsample ($READS reads) ..."
+# Write summary header early so the output directory is never empty.
+printf "algo\tdist\tratio\tclusters\tmax_rss\treal_s\toutput_file\n" > "$SUMMARY"
+
+log "Preparing subsample ($READS reads) ..."
 if [[ "$INPUT" == *.gz ]]; then
   gzip -dc "$INPUT" | awk -v max="$READS" '{ print; if (NR % 4 == 0) {r++; if (r >= max) exit} }' > "$SUB_FASTQ"
 else
   awk -v max="$READS" '{ print; if (NR % 4 == 0) {r++; if (r >= max) exit} }' "$INPUT" > "$SUB_FASTQ"
 fi
 
-echo "Converting subsample FASTQ -> counts TSV ..."
+if [[ ! -s "$SUB_FASTQ" ]]; then
+  echo "Subsample FASTQ is empty. Check input format/path." >> "$ERR_LOG"
+  exit 1
+fi
+
+log "Converting subsample FASTQ -> counts TSV ..."
 awk 'NR % 4 == 2' "$SUB_FASTQ" \
   | LC_ALL=C sort -S "$SORT_MEM" -T "$TMPDIR_SWEEP" \
   | uniq -c \
   | awk '{print $2"\t"$1}' > "$COUNTS_TSV"
+
+if [[ ! -s "$COUNTS_TSV" ]]; then
+  echo "Counts TSV is empty after conversion." >> "$ERR_LOG"
+  exit 1
+fi
 
 TIME_CMD="/usr/bin/time"
 TIME_ARGS="-l"
@@ -175,9 +208,7 @@ run_case() {
     "$algo" "$dist" "$ratio" "$clusters" "$rss" "$real_s" "$out_file" >> "$SUMMARY"
 }
 
-printf "algo\tdist\tratio\tclusters\tmax_rss\treal_s\toutput_file\n" > "$SUMMARY"
-
-echo "Running sweep ..."
+log "Running sweep ..."
 for d in $DISTS; do
   for r in $RATIOS; do
     run_case mp "$d" "$r" --cluster-ratio "$r"
@@ -187,5 +218,5 @@ for d in $DISTS; do
   run_case cc_stream "$d" NA --connected-comp --stream-clusters
 done
 
-echo "Done. Summary: $SUMMARY"
-echo "Tip: sort by clusters/time to find stable fast settings."
+log "Done. Summary: $SUMMARY"
+log "Tip: sort by clusters/time to find stable fast settings."
