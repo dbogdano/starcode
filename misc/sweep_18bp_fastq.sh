@@ -24,6 +24,7 @@ Required:
 
 Options:
   -n READS             Reads to subsample from head (default: 5000000)
+  --read-sizes "LIST"  Space-separated read counts to sweep (overrides -n)
   -t THREADS           Starcode threads (default: 1)
   -a PATTERN           Optional --allow pattern (e.g. NNHNNYRNNNNYRNNHNN)
   -o DIR               Output directory (default: sweep_YYYYmmdd_HHMMSS)
@@ -36,7 +37,7 @@ Options:
 
 Output:
   summary.tsv columns:
-    algo\tdist\tratio\tclusters\tmax_rss\treal_s\toutput_file
+    reads\talgo\tdist\tratio\tclusters\tmax_rss\treal_s\toutput_file
 
 Algorithms swept:
   mp, sphere, cc, cc_stream
@@ -45,6 +46,7 @@ EOF
 
 INPUT=""
 READS=5000000
+READ_SIZES=""
 THREADS=1
 ALLOW_PATTERN=""
 OUTDIR=""
@@ -58,6 +60,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -i) INPUT="$2"; shift 2 ;;
     -n) READS="$2"; shift 2 ;;
+    --read-sizes) READ_SIZES="$2"; shift 2 ;;
     -t) THREADS="$2"; shift 2 ;;
     -a) ALLOW_PATTERN="$2"; shift 2 ;;
     -o) OUTDIR="$2"; shift 2 ;;
@@ -91,10 +94,19 @@ if [[ ! -x "$STARCODE_BIN" \
   (cd "$ROOT_DIR" && make -s)
 fi
 
-# Ensure expected options exist in the binary.
-if ! "$STARCODE_BIN" --help 2>&1 | grep -q -- "--stream-clusters"; then
-  echo "Binary does not support --stream-clusters. Rebuilding..."
-  (cd "$ROOT_DIR" && make -s)
+# Detect optional support for --stream-clusters.
+HAS_STREAM_CLUSTERS=0
+if "$STARCODE_BIN" --help 2>&1 | grep -q -- "--stream-clusters"; then
+  HAS_STREAM_CLUSTERS=1
+else
+  # If using repo-local binary, rebuild once and re-check.
+  if [[ "$STARCODE_BIN" == "$ROOT_DIR/starcode" ]]; then
+    echo "Binary does not support --stream-clusters. Rebuilding..."
+    (cd "$ROOT_DIR" && make -s)
+    if "$STARCODE_BIN" --help 2>&1 | grep -q -- "--stream-clusters"; then
+      HAS_STREAM_CLUSTERS=1
+    fi
+  fi
 fi
 
 if [[ -z "$OUTDIR" ]]; then
@@ -130,40 +142,7 @@ COUNTS_TSV="$TMPDIR_SWEEP/subsample.counts.tsv"
 SUMMARY="$OUTDIR/summary.tsv"
 
 # Write summary header early so the output directory is never empty.
-printf "algo\tdist\tratio\tclusters\tmax_rss\treal_s\toutput_file\n" > "$SUMMARY"
-
-log "Preparing subsample ($READS reads) ..."
-if [[ "$INPUT" == *.gz ]]; then
-  # Avoid false failures from SIGPIPE (141) when reader exits early.
-  set +e
-  set +o pipefail
-  gzip -dc "$INPUT" | awk -v max="$READS" '{ print; if (NR % 4 == 0) {r++; if (r >= max) exit} }' > "$SUB_FASTQ"
-  subsample_rc=$?
-  set -o pipefail
-  set -e
-  if [[ "$subsample_rc" -ne 0 ]]; then
-    echo "Subsample extraction failed for gz input (exit $subsample_rc)." >> "$ERR_LOG"
-    exit "$subsample_rc"
-  fi
-else
-  awk -v max="$READS" '{ print; if (NR % 4 == 0) {r++; if (r >= max) exit} }' "$INPUT" > "$SUB_FASTQ"
-fi
-
-if [[ ! -s "$SUB_FASTQ" ]]; then
-  echo "Subsample FASTQ is empty. Check input format/path." >> "$ERR_LOG"
-  exit 1
-fi
-
-log "Converting subsample FASTQ -> counts TSV ..."
-awk 'NR % 4 == 2' "$SUB_FASTQ" \
-  | LC_ALL=C sort -S "$SORT_MEM" -T "$TMPDIR_SWEEP" \
-  | uniq -c \
-  | awk '{print $2"\t"$1}' > "$COUNTS_TSV"
-
-if [[ ! -s "$COUNTS_TSV" ]]; then
-  echo "Counts TSV is empty after conversion." >> "$ERR_LOG"
-  exit 1
-fi
+printf "reads\talgo\tdist\tratio\tclusters\tmax_rss\treal_s\toutput_file\n" > "$SUMMARY"
 
 TIME_CMD=""
 TIME_ARGS=""
@@ -210,8 +189,8 @@ run_case() {
   local dist="$2"
   local ratio="$3"
   shift 3
-  local out_file="$OUTDIR/${algo}_d${dist}_r${ratio}.out"
-  local log_file="$OUTDIR/${algo}_d${dist}_r${ratio}.time"
+  local out_file="$OUTDIR/n${READS_CURRENT}_${algo}_d${dist}_r${ratio}.out"
+  local log_file="$OUTDIR/n${READS_CURRENT}_${algo}_d${dist}_r${ratio}.time"
 
   local cmd=("$STARCODE_BIN" -q --counts-input -i "$COUNTS_TSV" -o "$out_file" --dist "$dist" --threads "$THREADS")
 
@@ -252,19 +231,70 @@ run_case() {
   local real_s
   real_s=$(extract_real_s "$log_file")
 
-  printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-    "$algo" "$dist" "$ratio" "$clusters" "$rss" "$real_s" "$out_file" >> "$SUMMARY"
+  printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    "$READS_CURRENT" "$algo" "$dist" "$ratio" "$clusters" "$rss" "$real_s" "$out_file" >> "$SUMMARY"
 }
 
-log "Running sweep ..."
-for d in $DISTS; do
-  for r in $RATIOS; do
-    run_case mp "$d" "$r" --cluster-ratio "$r"
+if [[ -z "$READ_SIZES" ]]; then
+  READ_SIZES="$READS"
+fi
+
+for READS_CURRENT in $READ_SIZES; do
+  SUB_FASTQ="$TMPDIR_SWEEP/subsample_n${READS_CURRENT}.fastq"
+  COUNTS_TSV="$TMPDIR_SWEEP/subsample_n${READS_CURRENT}.counts.tsv"
+
+  log "Preparing subsample ($READS_CURRENT reads) ..."
+  if [[ "$INPUT" == *.gz ]]; then
+    # Avoid false failures from SIGPIPE (141) when reader exits early.
+    set +e
+    set +o pipefail
+    gzip -dc "$INPUT" | awk -v max="$READS_CURRENT" '{ print; if (NR % 4 == 0) {r++; if (r >= max) exit} }' > "$SUB_FASTQ"
+    subsample_rc=$?
+    set -o pipefail
+    set -e
+    if [[ "$subsample_rc" -ne 0 ]]; then
+      echo "Subsample extraction failed for gz input (exit $subsample_rc)." >> "$ERR_LOG"
+      exit "$subsample_rc"
+    fi
+  else
+    awk -v max="$READS_CURRENT" '{ print; if (NR % 4 == 0) {r++; if (r >= max) exit} }' "$INPUT" > "$SUB_FASTQ"
+  fi
+
+  if [[ ! -s "$SUB_FASTQ" ]]; then
+    echo "Subsample FASTQ is empty for reads=$READS_CURRENT. Check input format/path." >> "$ERR_LOG"
+    exit 1
+  fi
+
+  log "Converting subsample FASTQ -> counts TSV (reads=$READS_CURRENT) ..."
+  awk 'NR % 4 == 2' "$SUB_FASTQ" \
+    | LC_ALL=C sort -S "$SORT_MEM" -T "$TMPDIR_SWEEP" \
+    | uniq -c \
+    | awk '{print $2"\t"$1}' > "$COUNTS_TSV"
+
+  if [[ ! -s "$COUNTS_TSV" ]]; then
+    echo "Counts TSV is empty after conversion for reads=$READS_CURRENT." >> "$ERR_LOG"
+    exit 1
+  fi
+
+  log "Running sweep (reads=$READS_CURRENT) ..."
+  for d in $DISTS; do
+    for r in $RATIOS; do
+      run_case mp "$d" "$r" --cluster-ratio "$r"
+    done
+    run_case sphere "$d" NA --sphere
+    run_case cc "$d" NA --connected-comp
+    if [[ "$HAS_STREAM_CLUSTERS" -eq 1 ]]; then
+      run_case cc_stream "$d" NA --connected-comp --stream-clusters
+    else
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$READS_CURRENT" "cc_stream" "$d" "NA" "SKIPPED" "NA" "NA" "unsupported_by_binary" >> "$SUMMARY"
+    fi
   done
-  run_case sphere "$d" NA --sphere
-  run_case cc "$d" NA --connected-comp
-  run_case cc_stream "$d" NA --connected-comp --stream-clusters
 done
+
+if [[ "$HAS_STREAM_CLUSTERS" -eq 0 ]]; then
+  echo "Warning: STARCODE_BIN does not support --stream-clusters; cc_stream rows were skipped." >&2
+fi
 
 log "Done. Summary: $SUMMARY"
 log "Tip: sort by clusters/time to find stable fast settings."
