@@ -165,13 +165,23 @@ if [[ ! -s "$COUNTS_TSV" ]]; then
   exit 1
 fi
 
-TIME_CMD="/usr/bin/time"
-TIME_ARGS="-l"
-if ! command -v /usr/bin/time >/dev/null 2>&1; then
-  if command -v gtime >/dev/null 2>&1; then
-    TIME_CMD="gtime"
+TIME_CMD=""
+TIME_ARGS=""
+if command -v /usr/bin/time >/dev/null 2>&1; then
+  # Detect BSD time (macOS, supports -l) vs GNU time (Linux, supports -v).
+  if /usr/bin/time -l true >/dev/null 2>&1; then
+    TIME_CMD="/usr/bin/time"
+    TIME_ARGS="-l"
+  else
+    TIME_CMD="/usr/bin/time"
     TIME_ARGS="-v"
   fi
+elif command -v gtime >/dev/null 2>&1; then
+  TIME_CMD="gtime"
+  TIME_ARGS="-v"
+else
+  echo "No compatible 'time' command found (/usr/bin/time or gtime)." >> "$ERR_LOG"
+  exit 1
 fi
 
 extract_rss() {
