@@ -124,7 +124,10 @@ printf "algo\tdist\tratio\tclusters\tmax_rss\treal_s\toutput_file\n" > "$SUMMARY
 
 log "Preparing subsample ($READS reads) ..."
 if [[ "$INPUT" == *.gz ]]; then
-  gzip -dc "$INPUT" | awk -v max="$READS" '{ print; if (NR % 4 == 0) {r++; if (r >= max) exit} }' > "$SUB_FASTQ"
+  # Use process substitution to avoid SIGPIPE/141 when awk exits early
+  # after collecting max reads from a compressed stream.
+  awk -v max="$READS" '{ print; if (NR % 4 == 0) {r++; if (r >= max) exit} }' \
+    < <(gzip -dc "$INPUT") > "$SUB_FASTQ"
 else
   awk -v max="$READS" '{ print; if (NR % 4 == 0) {r++; if (r >= max) exit} }' "$INPUT" > "$SUB_FASTQ"
 fi
