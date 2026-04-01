@@ -222,6 +222,7 @@ void transfer_useq_ids(useq_t*, useq_t*);
 void unpad_useq(gstack_t*);
 void* nukesort(void*);
 void apply_allow_pattern(gstack_t*);  // NEW: forward declaration
+size_t filter_a_rich_artifact_neighbors(gstack_t*, const char*, int, double);
 
 //    Global variables    //
 static FILE* OUTPUTF1 = NULL;              // output file 1
@@ -499,6 +500,68 @@ int iupac_matches(const char* pattern, const char* seq) {
   return 1;
 }
 
+size_t
+filter_a_rich_artifact_neighbors(
+    gstack_t* uSQ,
+    const char* artifact_seed,
+    int artifact_max_dist,
+    double artifact_min_afrac) {
+  if (uSQ == NULL || artifact_seed == NULL)
+    return 0;
+
+  size_t seed_len = strlen(artifact_seed);
+  if (seed_len == 0)
+    return 0;
+
+  // Normalize seed to uppercase.
+  char* seed_up = malloc(seed_len + 1);
+  if (seed_up == NULL) {
+    alert();
+    krash();
+  }
+  for (size_t i = 0; i < seed_len; i++) {
+    unsigned char c = (unsigned char)artifact_seed[i];
+    seed_up[i] = c < sizeof(capitalize) ? capitalize[c] : artifact_seed[i];
+  }
+  seed_up[seed_len] = '\0';
+
+  size_t write_idx = 0;
+  size_t removed = 0;
+
+  for (size_t i = 0; i < uSQ->nitems; i++) {
+    useq_t* u = (useq_t*)uSQ->items[i];
+    int drop = 0;
+
+    if (u != NULL && u->seq != NULL && strlen(u->seq) == seed_len) {
+      size_t dist = 0;
+      size_t acount = 0;
+      for (size_t k = 0; k < seed_len; k++) {
+        unsigned char raw = (unsigned char)u->seq[k];
+        char c = raw < sizeof(capitalize) ? capitalize[raw] : u->seq[k];
+        if (c != seed_up[k])
+          dist++;
+        if (c == 'A')
+          acount++;
+      }
+      double afrac = (double)acount / (double)seed_len;
+      if ((int)dist <= artifact_max_dist && afrac >= artifact_min_afrac)
+        drop = 1;
+    }
+
+    if (drop) {
+      destroy_useq(u);
+      removed++;
+      continue;
+    }
+
+    uSQ->items[write_idx++] = u;
+  }
+
+  uSQ->nitems = write_idx;
+  free(seed_up);
+  return removed;
+}
+
 // Compute mean quality score from FASTQ quality string (Phred scale).
 // Assumes ASCII quality encoding (Phred+33 standard).
 // Returns -1.0 if qual_str is NULL or empty.
@@ -533,10 +596,15 @@ starcode(                // Public
     double parent_to_child,  // Merging threshold
     const int showclusters,  // Print cluster members
     const int showids,       // Print sequence ID numbers
+    const int streamclusters, // Stream clusters to output
     const int outputt,        // Output type (format)
     FILE* blacklistf,
   const char* allow_pattern,
-  int counts_input
+  int counts_input,
+  const int filter_a_rich,
+  const char* artifact_seed,
+  const int artifact_max_dist,
+  const double artifact_min_afrac
 )
 {
   OUTPUTF1 = outputf1;
@@ -547,8 +615,6 @@ starcode(                // Public
 
   /* decide whether to keep per-read IDs */
   NEED_SEQIDS = showids || (OUTPUTT == TIDY_OUTPUT);
-  /* Inform user on stdout whether per-read seq-ids will be stored */
-  printf("NEED_SEQIDS: %s\n", NEED_SEQIDS ? "ON" : "OFF");
   /* if you want explicit CLI override (e.g. --no-ids), apply it here */
 
   // Load blacklist before reading sequences so new_useq() can mark them.
@@ -582,6 +648,23 @@ starcode(                // Public
 
   /* Apply allow-pattern AFTER reading but BEFORE padding/sorting. */
   apply_allow_pattern(uSQ);
+
+  if (filter_a_rich) {
+    size_t removed = filter_a_rich_artifact_neighbors(
+        uSQ, artifact_seed, artifact_max_dist, artifact_min_afrac);
+    if (verbose) {
+      fprintf(stderr,
+          "artifact filter removed %zu sequences (seed=%s, max-dist=%d, min-A-frac=%.3f)\n",
+          removed,
+          artifact_seed == NULL ? "(null)" : artifact_seed,
+          artifact_max_dist,
+          artifact_min_afrac);
+    }
+    if (uSQ->nitems < 1) {
+      fprintf(stderr, "all sequences filtered out\n");
+      return 1;
+    }
+  }
 
   /* Debug, count how many sequences were marked blacklisted at the read time*/
   if (verbose) {
@@ -785,20 +868,58 @@ starcode(                // Public
   } else if (CLUSTERALG == COMPONENTS_CLUSTER) {
     if (verbose)
       fprintf(stderr, "connected components clustering\n");
-    // Cluster connected components.
-    // Returns a stack containing stacks of clusters, where
-    // clusters->item[i]->item[0] is the centroid of the i-th cluster. The
-    // output is sorted by cluster count, which is stored in
-    // centroid->count.
-    gstack_t* clusters = compute_clusters(uSQ);
-
-    // Default output.
-    if (OUTPUTT == DEFAULT_OUTPUT) {
+    if (OUTPUTT == DEFAULT_OUTPUT && streamclusters) {
       idstack_t* idstack = NULL;
       if (showids)
         idstack = idstack_new(64);
-      for (size_t i = 0; i < clusters->nitems; i++) {
-        gstack_t* cluster = (gstack_t*)clusters->items[i];
+      for (size_t i = 0; i < uSQ->nitems; i++) {
+        useq_t* useq = (useq_t*)uSQ->items[i];
+        if (useq->visited)
+          continue;
+
+        // Create new cluster.
+        gstack_t* cluster = new_gstack();
+
+        // Recursively gather connected components.
+        connected_components(useq, &cluster);
+
+        // Find centroid. (max: #counts THEN #edges).
+        size_t cluster_count = 0;
+        useq_t* centroid = NULL;
+        int centroid_edges = -1;
+        for (size_t k = 0; k < cluster->nitems; k++) {
+          useq_t* s = (useq_t*)cluster->items[k];
+          cluster_count += s->count;
+          if (s->blacklisted)
+            continue;
+          int cnt = 0;
+          if (s->matches != NULL) {
+            gstack_t* matches;
+            for (int j = 0; (matches = s->matches[j]) != TOWER_TOP; j++)
+              cnt += matches->nitems;
+          }
+          if (centroid == NULL || s->count > centroid->count ||
+              (s->count == centroid->count && cnt > centroid_edges)) {
+            centroid = s;
+            centroid_edges = cnt;
+          }
+        }
+
+        if (centroid != NULL) {
+          if (cluster->items[0] != centroid) {
+            for (size_t k = 1; k < cluster->nitems; k++)
+              if (cluster->items[k] == centroid) {
+                cluster->items[k] = cluster->items[0];
+                cluster->items[0] = centroid;
+                break;
+              }
+          }
+          centroid->canonical = centroid;
+          centroid->count = cluster_count;
+        } else {
+          ((useq_t*)cluster->items[0])->count = cluster_count;
+        }
+
         // Get canonical.
         useq_t* canonical = (useq_t*)cluster->items[0];
         // Print canonical and cluster count.
@@ -820,14 +941,59 @@ starcode(                // Public
             sort_and_print_ids(idstack);
         }
         fprintf(OUTPUTF1, "\n");
+
+        // Reset visited flags for this cluster to avoid side effects.
+        for (size_t k = 0; k < cluster->nitems; k++)
+          ((useq_t*)cluster->items[k])->visited = 0;
+        free(cluster);
       }
       if (showids)
         idstack_free(idstack);
-    } else if (OUTPUTT == NRED_OUTPUT) {
-      uSQ->nitems = 0;
-      // Fill uSQ with cluster centroids.
-      for (size_t i = 0; i < clusters->nitems; i++)
-        push(((gstack_t*)clusters->items[i])->items[0], &uSQ);
+    } else {
+      // Cluster connected components.
+      // Returns a stack containing stacks of clusters, where
+      // clusters->item[i]->item[0] is the centroid of the i-th cluster. The
+      // output is sorted by cluster count, which is stored in
+      // centroid->count.
+      gstack_t* clusters = compute_clusters(uSQ);
+
+      // Default output.
+      if (OUTPUTT == DEFAULT_OUTPUT) {
+        idstack_t* idstack = NULL;
+        if (showids)
+          idstack = idstack_new(64);
+        for (size_t i = 0; i < clusters->nitems; i++) {
+          gstack_t* cluster = (gstack_t*)clusters->items[i];
+          // Get canonical.
+          useq_t* canonical = (useq_t*)cluster->items[0];
+          // Print canonical and cluster count.
+          fprintf(OUTPUTF1, "%s\t%ld", canonical->seq, canonical->count);
+          if (showclusters || showids) {
+            fprintf(OUTPUTF1, "\t%s", canonical->seq);
+            if (showids) {
+              idstack->pos = 0;
+              idstack_push(canonical->seqid, canonical->nids, idstack);
+            }
+            for (size_t k = 1; k < cluster->nitems; k++) {
+              useq_t* u = (useq_t*)cluster->items[k];
+              if (showclusters)
+                fprintf(OUTPUTF1, ",%s", u->seq);
+              if (showids)
+                idstack_push(u->seqid, u->nids, idstack);
+            }
+            if (showids)
+              sort_and_print_ids(idstack);
+          }
+          fprintf(OUTPUTF1, "\n");
+        }
+        if (showids)
+          idstack_free(idstack);
+      } else if (OUTPUTT == NRED_OUTPUT) {
+        uSQ->nitems = 0;
+        // Fill uSQ with cluster centroids.
+        for (size_t i = 0; i < clusters->nitems; i++)
+          push(((gstack_t*)clusters->items[i])->items[0], &uSQ);
+      }
     }
   }
 

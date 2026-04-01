@@ -122,6 +122,11 @@ Starcode runs on Linux and Mac. It has not been tested on Windows.
      Adds a third column to the starcode output, containing the sequences that compose each cluster.
 	 By default, the output contains only the centroid and the counts.
 
+    **--stream-clusters**
+     
+      Streams connected-components cluster output without size sorting. This reduces memory usage for
+      very large datasets but does not guarantee clusters are sorted by size.
+
   **--seq-id**
      
      Shows the input sequence order (1-based) of the cluster components.

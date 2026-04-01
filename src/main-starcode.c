@@ -61,6 +61,10 @@ char *USAGE =
 "    -a --allow: IUPAC pattern of permitted barcodes (sequences not matching this\n"
 "               pattern will be treated as non-canonical; pattern length must match\n"
 "               input sequence length)\n"
+"       --filter-a-rich: drop A-rich low-complexity neighbors of an artifact seed\n"
+"       --artifact-seed: artifact seed sequence (default AAAAAAAAAAAAAAAAAA)\n"
+"       --artifact-max-dist: max Hamming distance to seed (default 2)\n"
+"       --artifact-min-afrac: minimum A fraction [0..1] (default 0.80)\n"
 "\n"
 "  input options (paired-end fastq files)\n"
 "    -1 --input1: input file 1\n"
@@ -73,6 +77,8 @@ char *USAGE =
 "  output format options\n"
 "       --non-redundant: remove redundant sequences from input file(s)\n"
 "       --print-clusters: outputs cluster compositions\n"
+"       --stream-clusters: stream connected-component clusters without\n"
+"               size sorting (reduces memory, keeps output order)\n"
 "       --seq-id: print sequence id numbers (1-based)\n"
 "       --tidy: print each sequence and its centroid\n"
 "\n"
@@ -145,13 +151,17 @@ main(
    static int vb_flag = 1;
    static int cl_flag = 0;
    static int id_flag = 0;
+   static int sc_flag = 0;
    static int cp_flag = 0;
    static int ci_flag = 0;  // counts-input mode
+   static int fa_flag = 0;  // artifact filter mode
 
    // Unset flags (value -1).
    int dist = -1;
    int threads = -1;
+   int artifact_max_dist = 2;
    double cluster_ratio = -1;
+   double artifact_min_afrac = 0.80;
 
    // Unset options (value 'UNSET').
    char * const UNSET = "unset";
@@ -162,6 +172,8 @@ main(
    char * output1 = UNSET;
    char * output2 = UNSET;
    char * allow_pattern = NULL;
+   char * artifact_seed = NULL;
+   int artifact_opts_set = 0;
 
    // Set input and output files
    FILE *inputf1 = NULL;
@@ -183,6 +195,7 @@ main(
       int option_index = 0;
       static struct option long_options[] = {
          {"print-clusters",    no_argument,       &cl_flag,  1 },
+         {"stream-clusters",   no_argument,       &sc_flag,  1 },
          {"seq-id",            no_argument,       &id_flag,  1 },
          {"non-redundant",     no_argument,       &nr_flag,  1 },
          {"tidy",              no_argument,       &td_flag,  1 },
@@ -202,11 +215,15 @@ main(
          {"output2",           required_argument,        0, '4'},
          {"blacklist-file",    required_argument,        0, 'b'},
          {"allow",     required_argument,                0, 'a'},
+         {"filter-a-rich",     no_argument,       &fa_flag,  1 },
+         {"artifact-seed",     required_argument,        0, 'x'},
+         {"artifact-max-dist", required_argument,        0, 'y'},
+         {"artifact-min-afrac",required_argument,        0, 'z'},
          {"counts-input",     no_argument,                &ci_flag, 1},
          {0, 0, 0, 0}
       };
 
-      c = getopt_long(argc, argv, "1:2:3:4:b:a:d:hi:o:qcst:r:v",
+      c = getopt_long(argc, argv, "1:2:3:4:b:a:x:y:z:d:hi:o:qcst:r:v",
             long_options, &option_index);
  
       // Done parsing //
@@ -290,6 +307,42 @@ main(
             fprintf(stderr, "debug: allow-pattern set to '%s'\n", allow_pattern);
          } else {
             fprintf(stderr, "%s --allow set more than once\n", ERRM);
+            say_usage();
+            return EXIT_FAILURE;
+         }
+         break;
+
+      case 'x':
+         artifact_opts_set = 1;
+         if (artifact_seed == NULL) {
+            artifact_seed = malloc(strlen(optarg) + 1);
+            if (artifact_seed == NULL) {
+               fprintf(stderr, "%s out of memory allocating artifact-seed\n", ERRM);
+               return EXIT_FAILURE;
+            }
+            strcpy(artifact_seed, optarg);
+         } else {
+            fprintf(stderr, "%s --artifact-seed set more than once\n", ERRM);
+            say_usage();
+            return EXIT_FAILURE;
+         }
+         break;
+
+      case 'y':
+         artifact_opts_set = 1;
+         artifact_max_dist = atoi(optarg);
+         if (artifact_max_dist < 0) {
+            fprintf(stderr, "%s --artifact-max-dist must be >= 0\n", ERRM);
+            say_usage();
+            return EXIT_FAILURE;
+         }
+         break;
+
+      case 'z':
+         artifact_opts_set = 1;
+         artifact_min_afrac = atof(optarg);
+         if (artifact_min_afrac < 0.0 || artifact_min_afrac > 1.0) {
+            fprintf(stderr, "%s --artifact-min-afrac must be in [0,1]\n", ERRM);
             say_usage();
             return EXIT_FAILURE;
          }
@@ -467,6 +520,18 @@ main(
       return EXIT_FAILURE;
    }
 
+   if (artifact_opts_set)
+      fa_flag = 1;
+
+   if (fa_flag && artifact_seed == NULL) {
+      artifact_seed = malloc(19);
+      if (artifact_seed == NULL) {
+         fprintf(stderr, "%s out of memory allocating default artifact-seed\n", ERRM);
+         return EXIT_FAILURE;
+      }
+      strcpy(artifact_seed, "AAAAAAAAAAAAAAAAAA");
+   }
+
    // Set output type. //
    int output_type;
    if      (nr_flag) output_type = NRED_OUTPUT;
@@ -573,10 +638,15 @@ main(
        cluster_ratio,
        cl_flag,
        id_flag,
+      sc_flag,
        output_type,
        blacklistf,
          allow_pattern,
-         ci_flag
+             ci_flag,
+         fa_flag,
+         artifact_seed,
+         artifact_max_dist,
+         artifact_min_afrac
    );
 
    if (inputf1 != stdin)   fclose(inputf1);
@@ -585,6 +655,7 @@ main(
    if (outputf2 != NULL)   fclose(outputf2);
    if (blacklistf != NULL) fclose(blacklistf);
    if (allow_pattern) free(allow_pattern);
+   if (artifact_seed) free(artifact_seed);
 
    return exitcode;
 

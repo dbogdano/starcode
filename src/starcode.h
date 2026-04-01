@@ -56,10 +56,15 @@ int starcode(
          double parent_to_child,
    const int showclusters,
    const int showids,
+   const int streamclusters,
    const int outputt,
    FILE *blacklistf,
       const char *allow_pattern,
-      int counts_input
+      int counts_input,
+   const int filter_a_rich,
+   const char *artifact_seed,
+   const int artifact_max_dist,
+   const double artifact_min_afrac
 );
 
 #endif

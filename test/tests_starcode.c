@@ -1082,8 +1082,9 @@ test_tidy_output
 
    // Call starcode on text file with default options and tidy output.
    FILE* text_test_file = fopen("test_file.txt", "r");
-   starcode(text_test_file, NULL, NULL, NULL, 2, 0, 1,
-       MP_CLUSTER, 5, 0, 0, TIDY_OUTPUT);
+      starcode(text_test_file, NULL, NULL, NULL, 2, 0, 1,
+         MP_CLUSTER, 5, 0, 0, 0, TIDY_OUTPUT, NULL, NULL, 0,
+         0, NULL, 2, 0.80);
    fclose(text_test_file);
 
    char EXPECTED_OUTPUT_TXT[] =
@@ -1131,8 +1132,9 @@ test_tidy_output
 
    // Call starcode on fasta file with default options and tidy output.
    FILE* fasta_test_file = fopen("test_file.fasta", "r");
-   starcode(fasta_test_file, NULL, NULL, NULL, 2, 0, 1,
-       MP_CLUSTER, 5, 0, 0, TIDY_OUTPUT);
+      starcode(fasta_test_file, NULL, NULL, NULL, 2, 0, 1,
+         MP_CLUSTER, 5, 0, 0, 0, TIDY_OUTPUT, NULL, NULL, 0,
+         0, NULL, 2, 0.80);
    fclose(fasta_test_file);
 
    char EXPECTED_OUTPUT_FASTX[] =
@@ -1150,8 +1152,9 @@ test_tidy_output
 
    // Call starcode on fastq file with default options and tidy output.
    FILE* fastq_test_file = fopen("test_file1.fastq", "r");
-   starcode(fastq_test_file, NULL, NULL, NULL, 2, 0, 1,
-       MP_CLUSTER, 5, 0, 0, TIDY_OUTPUT);
+      starcode(fastq_test_file, NULL, NULL, NULL, 2, 0, 1,
+         MP_CLUSTER, 5, 0, 0, 0, TIDY_OUTPUT, NULL, NULL, 0,
+         0, NULL, 2, 0.80);
    fclose(fastq_test_file);
 
    test_assert(strncmp(STDOUT_BUFFER, EXPECTED_OUTPUT_FASTX, 4096) == 0);
@@ -1163,8 +1166,9 @@ test_tidy_output
    // Call starcode on fastq file with default options and tidy output.
    FILE* fastq_test_file1 = fopen("test_file1.fastq", "r");
    FILE* fastq_test_file2 = fopen("test_file2.fastq", "r");
-   starcode(fastq_test_file1, fastq_test_file2, NULL, NULL, 2, 0, 1,
-       MP_CLUSTER, 5, 0, 0, TIDY_OUTPUT);
+      starcode(fastq_test_file1, fastq_test_file2, NULL, NULL, 2, 0, 1,
+         MP_CLUSTER, 5, 0, 0, 0, TIDY_OUTPUT, NULL, NULL, 0,
+         0, NULL, 2, 0.80);
    fclose(fastq_test_file1);
    fclose(fastq_test_file2);
 
